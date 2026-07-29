@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test";
 
-import { pageRows, renderToolbar, sameStreamParams, toolbarActionsFromMouseEvents } from "./viewer";
+import {
+  contentPlacement,
+  pageRows,
+  renderToolbar,
+  samePlacement,
+  sameStreamParams,
+  toolbarActionsFromMouseEvents,
+} from "./viewer";
 
 const tabs = [
   { targetId: "one", title: "First", url: "https://one.test", active: true },
@@ -76,6 +83,80 @@ test("browser toolbar keeps an overflowing active tab actionable", () => {
 test("page rows reserve only browser chrome and enabled diagnostics", () => {
   expect(pageRows(24, false)).toBe(22);
   expect(pageRows(24, true)).toBe(21);
+});
+
+test("contentPlacement contain-fits a 16:9 frame inside a square-ish content area", () => {
+  // 80x40 cells × 10x20 px = 800x800 content. 16:9 frame → letterbox height.
+  const placement = contentPlacement(
+    { columns: 80, rows: 40 },
+    {
+      width: 1280,
+      height: 720,
+      rasterWidth: 1280,
+      rasterHeight: 720,
+      browserZoom: 1,
+      source: "fallback-cell",
+      cellPixels: { width: 10, height: 20 },
+    },
+    { lastFrameSize: { width: 1920, height: 1080 } },
+  );
+  expect(placement.gridCols).toBe(80);
+  expect(placement.gridRows).toBeLessThan(40);
+  expect(placement.viewportCol).toBe(0);
+  expect(placement.viewportRow).toBeGreaterThanOrEqual(2);
+  const boxAspect = (placement.gridCols * 10) / (placement.gridRows * 20);
+  expect(boxAspect).toBeCloseTo(16 / 9, 1);
+});
+
+test("contentPlacement uses viewport raster before the first frame", () => {
+  const placement = contentPlacement(
+    { columns: 100, rows: 50 },
+    {
+      width: 1000,
+      height: 1000,
+      rasterWidth: 1000,
+      rasterHeight: 1000,
+      browserZoom: 1,
+      source: "fallback-cell",
+      cellPixels: { width: 10, height: 20 },
+    },
+    { lastFrameSize: null },
+  );
+  // Before a real frame arrives, the viewer uses the known viewport raster.
+  expect(placement).toEqual({
+    viewportCol: 0,
+    viewportRow: 2,
+    gridCols: 100,
+    gridRows: 50,
+  });
+});
+
+test("contentPlacement fills the grid when frame aspect matches content", () => {
+  const placement = contentPlacement(
+    { columns: 100, rows: 40 },
+    {
+      width: 1000,
+      height: 800,
+      rasterWidth: 1000,
+      rasterHeight: 800,
+      browserZoom: 1,
+      source: "fallback-cell",
+      cellPixels: { width: 10, height: 20 },
+    },
+    { lastFrameSize: { width: 1000, height: 800 } },
+  );
+  expect(placement).toEqual({
+    viewportCol: 0,
+    viewportRow: 2,
+    gridCols: 100,
+    gridRows: 40,
+  });
+});
+
+test("samePlacement compares all placement fields", () => {
+  const placement = { viewportCol: 0, viewportRow: 2, gridCols: 80, gridRows: 34 };
+  expect(samePlacement(placement, { ...placement })).toBe(true);
+  expect(samePlacement(placement, { ...placement, gridRows: 35 })).toBe(false);
 });
 
 test("sameStreamParams requires prior params to skip a re-POST", () => {

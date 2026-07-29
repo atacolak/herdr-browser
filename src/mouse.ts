@@ -1,6 +1,9 @@
 export type MouseRenderState = {
   columns: number;
   rows: number;
+  /** 0-based column origin of the image grid within the pane (default 0). */
+  columnOffset?: number;
+  /** Rows reserved above the image grid (toolbar). */
   rowOffset?: number;
   viewport: {
     width: number;
@@ -151,13 +154,17 @@ function viewportEventFromMouseEvent(
   state: MouseRenderState,
 ): { kind: "click"; click: MouseClick } | { kind: "wheel"; wheel: MouseWheel } | { kind: "move"; move: MouseMove } | null {
   const { button, column, row, released } = event;
+  const columnOffset = state.columnOffset ?? 0;
+  // Convert 1-based terminal coordinates into 1-based coords within the image
+  // placement rectangle (which may be letterboxed inside the content area).
+  const gridColumn = column - columnOffset;
   const gridRow = row - (state.rowOffset ?? 0);
-  if (gridRow < 1 || gridRow > state.rows || column < 1 || column > state.columns) {
+  if (gridRow < 1 || gridRow > state.rows || gridColumn < 1 || gridColumn > state.columns) {
     return null;
   }
 
   const point = {
-    x: Math.floor(((column - 0.5) / state.columns) * state.viewport.width),
+    x: Math.floor(((gridColumn - 0.5) / state.columns) * state.viewport.width),
     y: Math.floor(((gridRow - 0.5) / state.rows) * state.viewport.height),
   };
   const buttonCode = button & 3;
@@ -179,7 +186,7 @@ function viewportEventFromMouseEvent(
       kind: "move",
       move: {
         ...point,
-        column,
+        column: gridColumn,
         row: gridRow,
       },
     };

@@ -143,7 +143,13 @@ input, and URLs that do not match the local-link handler continue through
 Herdr's normal external browser behavior.
 
 By default, a local link opens the browser in a focused right split. Configure
-that behavior in `browser.json` under the plugin configuration directory:
+that behavior in `browser.json` under the plugin configuration directory.
+
+**Split ratio is outside this plugin.** Herdr controls how wide the browser
+pane is. The viewer contain-fits the frame (letterbox/pillarbox, no crop, no
+forced square) inside whatever pane it receives; it does not change the split.
+When pane and page aspect ratios differ, the full page remains centered with
+bars rather than stretching.
 
 ```bash
 herdr plugin config-dir official.browser
@@ -172,7 +178,9 @@ in ten-percent steps and persist the new default to this file. Pane resizing
 does not change browser zoom.
 
 `showDiagnostics` reserves a bottom status row with stream and viewport metrics.
-It defaults to `false` and is intended for performance debugging.
+It defaults to `false` and is intended for performance debugging. The diagnostics
+line includes a `fit=COLSxROWS@COL,ROW` field showing the contain-fit placement
+inside the content area.
 
 `captureScale` reduces the captured frame size from `0.1` through `1` and
 defaults to `1`. Frames are captured at full device pixels, so a HiDPI display
@@ -181,6 +189,9 @@ the terminal's decode and texture upload. Setting `0.75` cuts pixel count by
 roughly 44% for a modest loss of sharpness, and is the most effective knob
 available if a browser pane costs more CPU than you want. Text stays legible
 well below `1` because the pane is already downscaled to fit the cell grid.
+Contain-fit placement does not change capture resolution or screencast
+bandwidth: the encoder still sizes to the content-area raster; only the
+on-screen cell rectangle is adjusted.
 
 `captureBackend`, `screencastEveryNthFrame`, and `screencastPollMs` tune the
 frame pipeline itself and rarely need changing. `captureBackend` selects

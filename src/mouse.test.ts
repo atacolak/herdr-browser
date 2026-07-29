@@ -39,6 +39,28 @@ test("parseSgrMouseInput maps clicks below a reserved row offset", () => {
   });
 });
 
+test("parseSgrMouseInput maps clicks inside a letterboxed placement", () => {
+  // Image occupies cols 21-80 (60 cols) starting at row 5 (40 rows), centered
+  // inside a larger content area. Click column 50 / row 25 → local (30, 21).
+  const letterboxed: MouseRenderState = {
+    columns: 60,
+    rows: 40,
+    columnOffset: 20,
+    rowOffset: 4,
+    viewport: { width: 1200, height: 800 },
+  };
+  // Local cell (30, 21) of 60×40 → ((29.5/60)*1200, (20.5/40)*800) floored.
+  expect(parseViewportInput("\x1b[<0;50;25m", letterboxed)).toEqual({
+    clicks: [{ x: 590, y: 409 }],
+    wheels: [],
+    moves: [],
+    keys: [],
+    remainder: "",
+  });
+  // Outside the placement (left of image) is ignored.
+  expect(parseSgrMouseInput("\x1b[<0;10;25m", letterboxed).clicks).toEqual([]);
+});
+
 test("parseSgrMouseInput ignores clicks outside the image grid", () => {
   expect(parseSgrMouseInput("\x1b[<0;101;20m", state).clicks).toEqual([]);
   expect(parseSgrMouseInput("\x1b[<0;50;41m", state).clicks).toEqual([]);

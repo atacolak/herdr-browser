@@ -49,6 +49,12 @@ import {
   type PaneGraphicsPlacement,
   type PaneGraphicsTarget,
 } from "./herdrGraphics";
+import {
+  containFitPlacement,
+  resolveFitImageSize,
+  type ContentArea,
+  type ImagePixels,
+} from "./imageFit";
 import { encodeKittyPng, terminalImageSize } from "./kitty";
 import { parseSgrMouseInput, type MouseMove, type SgrMouseEvent, type TerminalKeyInput } from "./mouse";
 import type { BrowserTabInfo, DaemonMetrics, DaemonStatus } from "./daemonProtocol";
@@ -78,6 +84,8 @@ type TerminalSize = {
 type RenderState = {
   size: TerminalSize;
   imageRows: number;
+  /** Contain-fit placement of the browser frame inside the content area. */
+  placement: PaneGraphicsPlacement;
   viewport: ViewportMetrics;
   url: string;
   title: string;
@@ -127,6 +135,8 @@ type RenderContext = {
   // Most rerenders reuse this instead of re-fetching from the daemon.
   latestStatus: DaemonStatus | null;
   latestMetrics: DaemonMetrics | null;
+  /** Last known screencast/screenshot pixel size used for aspect-preserving fit. */
+  lastFrameSize: ImagePixels | null;
   // Set once the daemon or this view is confirmed gone (410 / no-daemon
   // error). Polling stops and the pane shows a fixed "session ended" screen
   // instead of silently retrying forever.
@@ -226,6 +236,7 @@ async function main() {
       : null,
     latestStatus: null,
     latestMetrics: null,
+    lastFrameSize: null,
     sessionEnded: false,
     pollHandles: {
       heartbeat: null,
@@ -256,11 +267,14 @@ async function renderOnce(
 ): Promise<RenderState> {
   const size = terminalImageSize();
   const imageRows = pageRows(size.rows, context.showDiagnostics);
-  const imageSize = {
+  const contentSize = {
     columns: size.columns,
     rows: imageRows,
   };
-  const viewport = await terminalViewport(imageSize, context);
+  // Capture/viewport sizing still follows the full content area so the page
+  // keeps as many pixels as the pane can show. Placement below contain-fits
+  // the resulting frame so aspect is preserved when cell and frame aspects differ.
+  const viewport = await terminalViewport(contentSize, context);
   if (!sameViewport(context.appliedViewport, viewport)) {
     await setViewport(viewport.width, viewport.height, viewport.browserZoom, 1);
     context.appliedViewport = viewport;
@@ -272,6 +286,8 @@ async function renderOnce(
   const metrics = options.refreshStatus
     ? await refreshMetrics(context)
     : context.latestMetrics;
+  rememberFrameSize(context, metrics);
+  const placement = contentPlacement(contentSize, viewport, context);
   const toolbar = renderToolbar({
     columns: size.columns,
     url,
@@ -282,26 +298,26 @@ async function renderOnce(
   process.stdout.write(options.clearScreen ? "\x1b[2J\x1b[H" : "\x1b[H");
   process.stdout.write(toolbar.text);
   const renderedViaDirectStream = shouldWatchResize()
-    ? await renderDaemonGraphicsStream(context, {
-      columns: size.columns,
-      rows: imageRows,
-    }, scaledCaptureSize(viewport.rasterWidth, viewport.rasterHeight, configuredCaptureScale()))
+    ? await renderDaemonGraphicsStream(
+      context,
+      placement,
+      scaledCaptureSize(viewport.rasterWidth, viewport.rasterHeight, configuredCaptureScale()),
+    )
     : false;
   let transport = "daemon-stream";
   if (!renderedViaDirectStream) {
     const png = await screenshotData();
-    const renderedViaPaneGraphics = await renderPaneGraphics(context, png, {
-      columns: size.columns,
-      rows: imageRows,
-    });
+    const renderedViaPaneGraphics = await renderPaneGraphics(context, png, placement);
     transport = renderedViaPaneGraphics
       ? context.paneGraphics?.transport ?? "native"
       : "kitty-pty";
     if (!renderedViaPaneGraphics) {
-      process.stdout.write(`\x1b[${TOOLBAR_ROWS + 1};1H`);
+      // Position the cursor at the contain-fit origin before kitty placement so
+      // the image is not forced into a full-pane stretch via c/r alone.
+      process.stdout.write(`\x1b[${placement.viewportRow + 1};${placement.viewportCol + 1}H`);
       process.stdout.write(encodeKittyPng(png, {
-        columns: size.columns,
-        rows: imageRows,
+        columns: placement.gridCols,
+        rows: placement.gridRows,
         deletePrevious: options.deletePrevious,
       }));
     }
@@ -312,6 +328,7 @@ async function renderOnce(
     viewport,
     columns: size.columns,
     imageRows,
+    placement,
     transport,
     metrics,
   }));
@@ -319,6 +336,7 @@ async function renderOnce(
   return {
     size,
     imageRows,
+    placement,
     viewport,
     url,
     title: info.title,
@@ -329,7 +347,7 @@ async function renderOnce(
 
 async function renderDaemonGraphicsStream(
   context: RenderContext,
-  imageSize: { columns: number; rows: number },
+  placement: PaneGraphicsPlacement,
   capture: ScreencastCaptureSize | null,
 ): Promise<boolean> {
   if (context.graphicsTransport === "direct-kitty") {
@@ -338,12 +356,6 @@ async function renderDaemonGraphicsStream(
   if (!context.paneGraphics || context.paneGraphics.disabled || context.paneGraphics.directDisabled) {
     return false;
   }
-  const placement: PaneGraphicsPlacement = {
-    viewportCol: 0,
-    viewportRow: TOOLBAR_ROWS,
-    gridCols: imageSize.columns,
-    gridRows: imageSize.rows,
-  };
   // Every rerender (including ones driven by a keystroke or hover move) calls
   // this; skip the POST when the stream is already active with the same
   // placement/capture instead of re-establishing it every time. The status
@@ -404,7 +416,7 @@ function sameCapture(left: ScreencastCaptureSize | null, right: ScreencastCaptur
 async function renderPaneGraphics(
   context: RenderContext,
   png: string,
-  imageSize: { columns: number; rows: number },
+  placement: PaneGraphicsPlacement,
 ): Promise<boolean> {
   if (context.graphicsTransport === "direct-kitty") {
     return false;
@@ -422,15 +434,11 @@ async function renderPaneGraphics(
     await clearPaneGraphicsIfActive(context);
     return false;
   }
+  context.lastFrameSize = { width: image.width, height: image.height };
   const frame = {
     png: pngBuffer,
     image,
-    placement: {
-      viewportCol: 0,
-      viewportRow: TOOLBAR_ROWS,
-      gridCols: imageSize.columns,
-      gridRows: imageSize.rows,
-    },
+    placement,
   };
   if (!context.paneGraphics.streamDisabled) {
     try {
@@ -570,9 +578,10 @@ async function watchResize(
     }
     const rawInput = mouseInput + stdinDecoder.write(chunk);
     const parsed = parseSgrMouseInput(rawInput, {
-      columns: current.size.columns,
-      rows: current.imageRows,
-      rowOffset: TOOLBAR_ROWS,
+      columns: current.placement.gridCols,
+      rows: current.placement.gridRows,
+      columnOffset: current.placement.viewportCol,
+      rowOffset: current.placement.viewportRow,
       viewport: current.viewport,
     });
     mouseInput = parsed.remainder;
@@ -708,6 +717,10 @@ async function watchResize(
     try {
       const info = await refreshStatus(context);
       const metrics = await refreshMetrics(context);
+      const previousFrame = context.lastFrameSize
+        ? { ...context.lastFrameSize }
+        : null;
+      rememberFrameSize(context, metrics);
       if (
         context.paneGraphics?.transport === "daemon-stream" &&
         metrics &&
@@ -718,6 +731,23 @@ async function watchResize(
         context.paneGraphics.directDisabled = false;
         await rerender({ clearScreen: false, deletePrevious: false });
         return;
+      }
+      // Once the first real frame size is known (or the page resizes), recompute
+      // contain-fit placement so a 16:9 page is not left stretched to the full
+      // content grid from the pre-frame raster fallback.
+      if (frameSizeChanged(previousFrame, context.lastFrameSize)) {
+        const nextPlacement = contentPlacement(
+          { columns: current.size.columns, rows: current.imageRows },
+          current.viewport,
+          context,
+        );
+        if (!samePlacement(current.placement, nextPlacement)) {
+          await rerender({
+            clearScreen: false,
+            deletePrevious: false,
+          });
+          return;
+        }
       }
       if (info.url !== current.url || info.title !== current.title || !sameTabs(info.tabs, current.tabs)) {
         await rerender({
@@ -732,6 +762,7 @@ async function watchResize(
         viewport: current.viewport,
         columns: current.size.columns,
         imageRows: current.imageRows,
+        placement: current.placement,
         transport: context.paneGraphics?.transport ?? "none",
         metrics,
       }));
@@ -1545,6 +1576,72 @@ export function pageRows(totalRows: number, showDiagnostics: boolean): number {
   return Math.max(1, totalRows - TOOLBAR_ROWS - (showDiagnostics ? 1 : 0));
 }
 
+/**
+ * Contain-fit the browser frame inside the content cell area.
+ * Exported for regression tests.
+ */
+export function contentPlacement(
+  contentSize: { columns: number; rows: number },
+  viewport: ViewportMetrics,
+  context: Pick<RenderContext, "lastFrameSize">,
+): PaneGraphicsPlacement {
+  const cellPixels = viewport.cellPixels ?? FALLBACK_CELL_PIXELS;
+  const content: ContentArea = {
+    columns: contentSize.columns,
+    rows: contentSize.rows,
+    cellWidthPx: cellPixels.width,
+    cellHeightPx: cellPixels.height,
+    originCol: 0,
+    originRow: TOOLBAR_ROWS,
+  };
+  const image = resolveFitImageSize({
+    frame: context.lastFrameSize,
+    raster: {
+      width: viewport.rasterWidth,
+      height: viewport.rasterHeight,
+    },
+    fallbackAspect: 16 / 9,
+    content,
+  });
+  return containFitPlacement(content, image);
+}
+
+function rememberFrameSize(
+  context: RenderContext,
+  metrics: DaemonMetrics | null | undefined,
+): void {
+  const width = metrics?.graphics_stream.last_frame_width ?? 0;
+  const height = metrics?.graphics_stream.last_frame_height ?? 0;
+  if (width > 0 && height > 0) {
+    context.lastFrameSize = { width, height };
+  }
+}
+
+function frameSizeChanged(
+  left: ImagePixels | null,
+  right: ImagePixels | null,
+): boolean {
+  if (!right) {
+    return false;
+  }
+  if (!left) {
+    return true;
+  }
+  return left.width !== right.width || left.height !== right.height;
+}
+
+export function samePlacement(
+  left: PaneGraphicsPlacement,
+  right: PaneGraphicsPlacement,
+): boolean {
+  return (
+    left.viewportCol === right.viewportCol &&
+    left.viewportRow === right.viewportRow &&
+    left.gridCols === right.gridCols &&
+    left.gridRows === right.gridRows
+  );
+}
+
 function tabButtonLabel(tab: BrowserTabInfo, index: number): string {
   const marker = tab.active ? "*" : "";
   const rawLabel = tab.title || tab.url || "blank";
@@ -1569,6 +1666,7 @@ function renderStatusLine(options: {
   viewport: ViewportMetrics;
   columns: number;
   imageRows: number;
+  placement: PaneGraphicsPlacement;
   transport: string;
   metrics?: DaemonMetrics | null;
 }): string {
@@ -1582,7 +1680,8 @@ function renderStatusLine(options: {
   const error = options.metrics?.graphics_stream.last_error
     ? ` error=${options.metrics.graphics_stream.last_error}`
     : "";
-  return `transport=${options.transport}${stream}${error} viewport=${options.viewport.width}x${options.viewport.height} raster=${options.viewport.rasterWidth}x${options.viewport.rasterHeight} zoom=${Math.round(options.viewport.browserZoom * 100)}% cells=${options.columns}x${options.imageRows} source=${options.viewport.source}${cell} | ${label}`;
+  const fit = ` fit=${options.placement.gridCols}x${options.placement.gridRows}@${options.placement.viewportCol},${options.placement.viewportRow}`;
+  return `transport=${options.transport}${stream}${error} viewport=${options.viewport.width}x${options.viewport.height} raster=${options.viewport.rasterWidth}x${options.viewport.rasterHeight} zoom=${Math.round(options.viewport.browserZoom * 100)}% cells=${options.columns}x${options.imageRows}${fit} source=${options.viewport.source}${cell} | ${label}`;
 }
 
 function streamFps(metrics: DaemonMetrics): string {
