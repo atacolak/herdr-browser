@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 
-import { launchChrome, type ChromeInstance } from "./chrome";
+import { chromeCdpHttpUrl, resolveChrome, type ChromeInstance } from "./chrome";
 import { CdpClient } from "./cdp";
 import {
   configuredCaptureBackend,
@@ -249,7 +249,7 @@ type BrowserRuntimeDependencies = {
 
 export async function createBrowserRuntime(
   dependencies: BrowserRuntimeDependencies = {
-    launch: launchChrome,
+    launch: resolveChrome,
     connect: CdpClient.connect,
   },
 ): Promise<BrowserRuntime> {
@@ -1095,9 +1095,11 @@ export async function automationDescriptor(
       : null,
     url: info.url,
     title: info.title,
-    chrome_pid: session.chrome.process.pid ?? null,
+    chrome_pid: session.chrome.ownership === "owned"
+      ? (session.chrome.child.pid ?? null)
+      : null,
     chrome_executable: session.chrome.executable,
-    chrome_profile_dir: session.chrome.profileDir,
+    chrome_profile_dir: session.chrome.profileDir ?? "",
     viewport,
     snippets: {
       playwright_mcp: `npx @playwright/mcp@latest --cdp-endpoint=${cdpHttpUrl}`,
@@ -1180,7 +1182,7 @@ async function refreshTabInfos(session: BrowserSession): Promise<void> {
 }
 
 async function fetchPageTargets(session: BrowserSession): Promise<CdpPageTarget[]> {
-  const response = await fetch(`${chromeCdpHttpUrl(session)}/json/list`);
+  const response = await fetch(`${chromeCdpHttpUrl(session.chrome)}/json/list`);
   if (!response.ok) {
     return [];
   }
@@ -1194,10 +1196,6 @@ function pageTargetToTargetInfo(target: CdpPageTarget): CdpTargetInfo {
     title: target.title,
     url: target.url,
   };
-}
-
-function chromeCdpHttpUrl(session: BrowserSession): string {
-  return `http://127.0.0.1:${session.chrome.port}`;
 }
 
 function isTimeoutError(error: unknown): boolean {

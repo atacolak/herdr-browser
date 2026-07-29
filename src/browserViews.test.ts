@@ -254,11 +254,13 @@ describe("browser view ownership", () => {
 
 async function fakeRuntime(cdp: FakeCdp): Promise<BrowserRuntime> {
   const chrome = {
+    ownership: "owned",
     executable: "fake-chrome",
     port: 9222,
     profileDir: "/tmp/fake-profile",
-    process: { pid: 1234 },
+    child: { pid: 1234, on() {}, once() {}, off() {} },
     browserWebSocketUrl: "ws://fake",
+    recentStderr: () => "",
     close: async () => {},
   } as unknown as ChromeInstance;
   return await createBrowserRuntime({

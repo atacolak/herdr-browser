@@ -46,6 +46,7 @@ import {
 } from "./browser";
 import { startCdpViewGateway, type CdpViewGateway } from "./cdpGateway";
 import { configuredCaptureBackend } from "./captureBackend";
+import { chromeCdpHttpUrl } from "./chrome";
 import { reapStaleChrome } from "./staleChrome";
 import { configuredScreencastEveryNthFrame } from "./screencastCadence";
 import { chromeProfileDir, daemonStateFile, ensurePrivateParentDir } from "./paths";
@@ -160,7 +161,7 @@ async function main() {
     };
     const startup = startCdpViewGateway({
       viewId: session.id,
-      cdpHttpUrl: `http://127.0.0.1:${session.chrome.port}`,
+      cdpHttpUrl: chromeCdpHttpUrl(session.chrome),
       browserWebSocketUrl: session.chrome.browserWebSocketUrl,
       listTabs: () => run(() => listTabs(session)),
       ownsTarget: (targetId) => ownsTarget(session, targetId),
@@ -220,12 +221,14 @@ async function main() {
     void shutdown(1);
   });
 
-  // The browser-level CDP socket closing, or the Chrome process exiting, means
-  // the browser is gone and every in-flight/future request would just time
-  // out with a generic 500 while the view lease keeps the daemon alive. Both
-  // conditions are treated as fatal so the client's retry-on-retiring-daemon
-  // path can recover with a fresh daemon + Chrome. `shuttingDown` guards
-  // against reacting to our own intentional shutdown closing these down.
+  // The browser-level CDP socket closing, or an owned Chrome process exiting,
+  // means the browser is gone and every in-flight/future request would just
+  // time out with a generic 500 while the view lease keeps the daemon alive.
+  // Both conditions are treated as fatal so the client's retry-on-retiring-
+  // daemon path can recover with a fresh daemon (and owned Chrome when
+  // applicable). External attach has no child process: death is observed only
+  // through the browser websocket onClose. `shuttingDown` guards against
+  // reacting to our own intentional shutdown closing these down.
   runtime.cdp.onClose((error) => {
     if (shuttingDown) {
       return;
@@ -233,16 +236,18 @@ async function main() {
     console.error("herdr-browser daemon: browser CDP connection closed unexpectedly", error?.message ?? "");
     void shutdown(1);
   });
-  runtime.chrome.process.once("exit", (code, signal) => {
-    if (shuttingDown) {
-      return;
-    }
-    console.error(
-      `herdr-browser daemon: chrome process exited unexpectedly (code=${code}, signal=${signal})`,
-      runtime.chrome.recentStderr(),
-    );
-    void shutdown(1);
-  });
+  if (runtime.chrome.ownership === "owned") {
+    runtime.chrome.child.once("exit", (code, signal) => {
+      if (shuttingDown) {
+        return;
+      }
+      console.error(
+        `herdr-browser daemon: chrome process exited unexpectedly (code=${code}, signal=${signal})`,
+        runtime.chrome.recentStderr(),
+      );
+      void shutdown(1);
+    });
+  }
 
   server = Bun.serve({
     hostname: "127.0.0.1",
@@ -260,7 +265,9 @@ async function main() {
           return json({
             ok: true,
             pid: process.pid,
-            chrome_pid: runtime.chrome.process.pid ?? null,
+            chrome_pid: runtime.chrome.ownership === "owned"
+              ? (runtime.chrome.child.pid ?? null)
+              : null,
             views: views.size,
           } satisfies DaemonHealth);
         }
@@ -365,7 +372,9 @@ async function main() {
           return json({
             ok: true,
             pid: process.pid,
-            chrome_pid: session.chrome.process.pid ?? null,
+            chrome_pid: session.chrome.ownership === "owned"
+              ? (session.chrome.child.pid ?? null)
+              : null,
             chrome_executable: session.chrome.executable,
             chrome_cdp_port: session.chrome.port,
             url: info.url,
@@ -701,6 +710,7 @@ async function main() {
   // setup throws (e.g. the state file write), the runtime must still be
   // closed so Chrome isn't orphaned holding the profile SingletonLock.
   try {
+    const ownership = runtime.chrome.ownership;
     const state: DaemonState = {
       instanceId,
       pid: process.pid,
@@ -709,8 +719,12 @@ async function main() {
       startedAt: new Date().toISOString(),
       captureBackend: configuredCaptureBackend(),
       screencastEveryNthFrame: configuredScreencastEveryNthFrame(),
-      profileDir: chromeProfileDir(),
-      chromePid: runtime.chrome.process.pid ?? null,
+      // External attach does not own a local profile; omit path identity noise.
+      profileDir: ownership === "owned" ? chromeProfileDir() : null,
+      // External browsers are never owned: never record a killable chromePid.
+      chromePid: ownership === "owned" ? (runtime.chrome.child.pid ?? null) : null,
+      chromeOwnership: ownership,
+      cdpUrl: ownership === "external" ? runtime.chrome.cdpUrl : null,
     };
     await ensurePrivateParentDir(stateFile);
     await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`, {

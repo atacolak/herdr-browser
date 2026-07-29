@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import { normalizeCdpHttpUrl } from "./cdpUrl";
 import { projectRoot } from "./paths";
 import {
   DEFAULT_BROWSER_ZOOM,
@@ -31,6 +32,8 @@ export type BrowserPluginConfig = {
   screencastEveryNthFrame: 1 | 2;
   screencastPollMs: number;
   profileRoot: string | null;
+  /** External CDP HTTP base URL. Null = launch owned Chrome. */
+  cdpUrl: string | null;
 };
 
 const DEFAULT_CONFIG: BrowserPluginConfig = {
@@ -44,6 +47,7 @@ const DEFAULT_CONFIG: BrowserPluginConfig = {
   screencastEveryNthFrame: DEFAULT_SCREENCAST_EVERY_NTH_FRAME,
   screencastPollMs: DEFAULT_SCREENCAST_POLL_MS,
   profileRoot: null,
+  cdpUrl: null,
 };
 const configWriteQueue = new SerialQueue();
 
@@ -87,6 +91,9 @@ export function normalizeConfig(raw: unknown): BrowserPluginConfig {
     profileRoot: typeof source.profileRoot === "string" && source.profileRoot.trim().length > 0
       ? source.profileRoot.trim()
       : DEFAULT_CONFIG.profileRoot,
+    cdpUrl: typeof source.cdpUrl === "string" && source.cdpUrl.trim().length > 0
+      ? normalizeCdpHttpUrl(source.cdpUrl)
+      : DEFAULT_CONFIG.cdpUrl,
   };
 }
 
@@ -102,6 +109,15 @@ export function applyBrowserConfigEnv(
     env.HERDR_BROWSER_PROFILE_ROOT = config.profileRoot;
   } else {
     delete env.HERDR_BROWSER_PROFILE_ROOT;
+  }
+  // Env wins over config so launchers can override without rewriting browser.json.
+  // Normalize strictly so invalid endpoints fail before any daemon spawn.
+  if (env.HERDR_BROWSER_CDP_URL?.trim()) {
+    env.HERDR_BROWSER_CDP_URL = normalizeCdpHttpUrl(env.HERDR_BROWSER_CDP_URL);
+  } else if (config.cdpUrl) {
+    env.HERDR_BROWSER_CDP_URL = normalizeCdpHttpUrl(config.cdpUrl);
+  } else {
+    delete env.HERDR_BROWSER_CDP_URL;
   }
 }
 

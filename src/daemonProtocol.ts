@@ -8,6 +8,8 @@ import type {
 
 export type { BrowserTabInfo } from "./browser";
 
+export type ChromeOwnership = "owned" | "external";
+
 export type DaemonState = {
   instanceId: string;
   pid: number;
@@ -16,8 +18,12 @@ export type DaemonState = {
   startedAt: string;
   captureBackend?: CaptureBackend;
   screencastEveryNthFrame?: 1 | 2;
-  profileDir?: string;
+  profileDir?: string | null;
   chromePid?: number | null;
+  /** owned = launched Chrome; external = attached via HERDR_BROWSER_CDP_URL. */
+  chromeOwnership?: ChromeOwnership;
+  /** External CDP HTTP base when chromeOwnership is external. */
+  cdpUrl?: string | null;
 };
 
 export type DaemonHealth = {

@@ -245,6 +245,34 @@ export HERDR_BROWSER_CHROME="/path/to/chrome"
 The current release does not download Chromium automatically. If no compatible
 browser is installed, startup fails with a discovery error.
 
+## External CDP
+
+By default the plugin launches and owns a headless Chromium. To attach instead
+to a browser you already started on this machine, point it at that browser's
+**loopback** CDP HTTP endpoint:
+
+```bash
+export HERDR_BROWSER_CDP_URL="http://127.0.0.1:9222"
+# or in browser.json: { "cdpUrl": "http://127.0.0.1:9222" }
+```
+
+Only plain `http://` on `127.0.0.1`, `localhost`, or `[::1]` is accepted (Chrome
+remote debugging is local HTTP, not HTTPS). `HERDR_BROWSER_CDP_URL` wins when
+both are set. Omit both for owned launch.
+
+Ownership rules:
+
+- Never launches, kills, or reaps the external browser.
+- Daemon shutdown and pane close only disconnect; browser death is observed via
+  the existing browser websocket close path.
+- Each view creates and owns a new page target; pre-existing tabs are left alone.
+- Daemon state files are namespaced by session and CDP endpoint so multiple
+  external ports can coexist.
+
+Start Chrome with remote debugging on loopback, confirm `/json/version`
+answers, then open a browser pane or run the CLI with the env set. Unset the
+env (and remove `cdpUrl`) to return to owned launch.
+
 ## Rendering
 
 Frames come from CDP screencast and reach the terminal through Herdr's pane

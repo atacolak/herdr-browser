@@ -17,6 +17,7 @@ test("normalizeConfig returns defaults for invalid config", () => {
     screencastEveryNthFrame: 1,
     screencastPollMs: 250,
     profileRoot: null,
+    cdpUrl: null,
   });
 });
 
@@ -32,6 +33,7 @@ test("normalizeConfig accepts supported pane options", () => {
     screencastEveryNthFrame: 2,
     screencastPollMs: 500,
     profileRoot: "/tmp/herdr-browser-profiles",
+    cdpUrl: "http://localhost:9222/",
   })).toEqual({
     linkOpenPlacement: "overlay",
     splitDirection: "down",
@@ -43,6 +45,7 @@ test("normalizeConfig accepts supported pane options", () => {
     screencastEveryNthFrame: 2,
     screencastPollMs: 500,
     profileRoot: "/tmp/herdr-browser-profiles",
+    cdpUrl: "http://127.0.0.1:9222",
   });
 });
 
@@ -56,6 +59,7 @@ test("normalizeConfig ignores unsupported pane options", () => {
     screencastEveryNthFrame: 3,
     screencastPollMs: 10,
     profileRoot: "  ",
+    cdpUrl: "  ",
   })).toEqual({
     linkOpenPlacement: "split",
     splitDirection: "right",
@@ -67,6 +71,7 @@ test("normalizeConfig ignores unsupported pane options", () => {
     screencastEveryNthFrame: 1,
     screencastPollMs: 250,
     profileRoot: null,
+    cdpUrl: null,
   });
 });
 
@@ -78,6 +83,7 @@ test("applyBrowserConfigEnv sets daemon configuration before startup", () => {
     browserZoom: 1.5,
     screencastEveryNthFrame: 2,
     profileRoot: "/tmp/herdr-browser-profiles",
+    cdpUrl: "http://127.0.0.1:9333",
   }), env);
 
   expect(env).toMatchObject({
@@ -86,7 +92,22 @@ test("applyBrowserConfigEnv sets daemon configuration before startup", () => {
     HERDR_BROWSER_SCREENCAST_EVERY_NTH_FRAME: "2",
     HERDR_BROWSER_SCREENCAST_POLL_MS: "250",
     HERDR_BROWSER_PROFILE_ROOT: "/tmp/herdr-browser-profiles",
+    HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9333",
   });
+});
+
+test("applyBrowserConfigEnv keeps an explicit HERDR_BROWSER_CDP_URL over config", () => {
+  const env: NodeJS.ProcessEnv = {
+    HERDR_BROWSER_CDP_URL: "http://localhost:9444/",
+  };
+  applyBrowserConfigEnv(normalizeConfig({
+    cdpUrl: "http://127.0.0.1:9333",
+  }), env);
+  expect(env.HERDR_BROWSER_CDP_URL).toBe("http://127.0.0.1:9444");
+});
+
+test("normalizeConfig rejects non-loopback cdpUrl", () => {
+  expect(() => normalizeConfig({ cdpUrl: "http://example.com:9222" })).toThrow(/loopback/);
 });
 
 test("normalizeConfig accepts previous scaling fields as browser zoom", () => {

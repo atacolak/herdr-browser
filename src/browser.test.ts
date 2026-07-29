@@ -16,6 +16,7 @@ import {
   switchTab,
   type BrowserSession,
 } from "./browser";
+import type { ChromeInstance } from "./chrome";
 import { ScreencastAckPacer } from "./screencastAckPacer";
 
 const originalFetch = globalThis.fetch;
@@ -678,13 +679,15 @@ function fakeSession(options: FakeSessionOptions): BrowserSession {
   return {
     id: "view-1",
     chrome: {
+      ownership: "owned",
       port: 3333,
       browserWebSocketUrl: "ws://127.0.0.1:3333/devtools/browser/browser-1",
       executable: "/usr/bin/chromium-browser",
       profileDir: "/tmp/herdr-browser-test",
-      process: { pid: 1234 },
+      child: { pid: 1234 },
+      recentStderr: () => "",
       close: async () => {},
-    },
+    } as ChromeInstance,
     cdp,
     targetId: activeTargetId,
     sessionId: activeSessionId,

@@ -8,11 +8,17 @@ import type { DaemonState } from "./daemonProtocol";
 // and a Chrome pid that's still alive, reap that Chrome before launching a
 // fresh one. Shared between the daemon (startup) and the client, which must
 // run it before it deletes the state file — the only record of that pid.
+//
+// External CDP mode never owns Chrome: chromeOwnership === "external" must
+// never kill the browser, even if a chromePid was somehow recorded.
 export async function reapStaleChrome(stateFilePath: string): Promise<void> {
   let previous: Partial<DaemonState> | null = null;
   try {
     previous = JSON.parse(await readFile(stateFilePath, "utf8")) as Partial<DaemonState>;
   } catch {
+    return;
+  }
+  if (previous.chromeOwnership === "external") {
     return;
   }
   if (typeof previous.pid !== "number" || isProcessAlive(previous.pid)) {

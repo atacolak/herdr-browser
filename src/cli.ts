@@ -271,6 +271,7 @@ Usage:
 
 Environment:
   HERDR_BROWSER_CHROME  Chrome/Chromium executable path
+  HERDR_BROWSER_CDP_URL  attach to external CDP HTTP endpoint (no launch/kill)
   HERDR_BROWSER_DAEMON_STATE  daemon state file override
 `);
 }

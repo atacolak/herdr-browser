@@ -93,3 +93,47 @@ test("session path components cannot traverse or alias", () => {
   expect(traversal).not.toBe("/tmp/plugin-state");
   expect(slash).not.toBe(underscore);
 });
+
+test("external CDP ports get distinct daemon state namespaces within one session", () => {
+  const base = {
+    HERDR_PLUGIN_STATE_DIR: "/tmp/plugin-state",
+    HERDR_SESSION: "browser-2",
+  };
+  const owned = daemonStateFile(base);
+  const portA = daemonStateFile({
+    ...base,
+    HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222",
+  });
+  const portB = daemonStateFile({
+    ...base,
+    HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9333",
+  });
+  const portATrailing = daemonStateFile({
+    ...base,
+    HERDR_BROWSER_CDP_URL: "http://localhost:9222/",
+  });
+
+  expect(owned).toBe("/tmp/plugin-state/daemon-browser-2-3310469cdfea.json");
+  expect(portA).not.toBe(owned);
+  expect(portB).not.toBe(owned);
+  expect(portA).not.toBe(portB);
+  expect(portA).toBe(portATrailing);
+  expect(portA.startsWith("/tmp/plugin-state/daemon-")).toBe(true);
+  expect(portA.endsWith(".json")).toBe(true);
+});
+
+test("external CDP does not alter chrome profile path", () => {
+  const base = {
+    HERDR_PLUGIN_STATE_DIR: "/tmp/plugin-state",
+    HERDR_SESSION: "browser-2",
+  };
+  const owned = chromeProfileDir(base);
+  const external = chromeProfileDir({
+    ...base,
+    HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222",
+  });
+  expect(owned).toBe(
+    "/tmp/plugin-state/chrome-profiles/browser-2-3310469cdfea",
+  );
+  expect(external).toBe(owned);
+});

@@ -10,7 +10,9 @@ import {
   isDaemonGoneError,
   metrics,
   removeStaleLock,
+  resetBrowserConfigAppliedForTest,
   status,
+  stopDaemon,
 } from "./daemonClient";
 import type { DaemonState } from "./daemonProtocol";
 import { chromeProfileDir } from "./paths";
@@ -46,6 +48,47 @@ test("daemon profile must match the configured per-session directory", () => {
   expect(daemonConfigMatches({ ...state, profileDir: undefined })).toBe(false);
 });
 
+test("daemon external CDP url must match the configured endpoint", () => {
+  const previous = process.env.HERDR_BROWSER_CDP_URL;
+  try {
+    delete process.env.HERDR_BROWSER_CDP_URL;
+    expect(daemonConfigMatches({
+      ...state,
+      chromeOwnership: "owned",
+      cdpUrl: null,
+    })).toBe(true);
+
+    process.env.HERDR_BROWSER_CDP_URL = "http://127.0.0.1:9222";
+    // Owned daemon cannot be reused when the env asks for external attach.
+    expect(daemonConfigMatches({
+      ...state,
+      chromeOwnership: "owned",
+      cdpUrl: null,
+    })).toBe(false);
+
+    // localhost and trailing slash are equivalent under strict normalization.
+    expect(daemonConfigMatches({
+      ...state,
+      chromeOwnership: "external",
+      cdpUrl: "http://localhost:9222/",
+      profileDir: null,
+    })).toBe(true);
+
+    expect(daemonConfigMatches({
+      ...state,
+      chromeOwnership: "external",
+      cdpUrl: "http://127.0.0.1:9333",
+      profileDir: null,
+    })).toBe(false);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.HERDR_BROWSER_CDP_URL;
+    } else {
+      process.env.HERDR_BROWSER_CDP_URL = previous;
+    }
+  }
+});
+
 test("automation discovery does not start a missing daemon", async () => {
   const previous = process.env.HERDR_BROWSER_DAEMON_STATE;
   process.env.HERDR_BROWSER_DAEMON_STATE = `/tmp/herdr-browser-missing-${crypto.randomUUID()}.json`;
@@ -73,6 +116,35 @@ test("heartbeatView, status, and metrics do not spawn a missing daemon", async (
     } else {
       process.env.HERDR_BROWSER_DAEMON_STATE = previous;
     }
+  }
+});
+
+test("non-spawning commands apply browser.json cdpUrl before state lookup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "herdr-browser-config-state-"));
+  const configPath = join(dir, "browser.json");
+  const explicitState = join(dir, "missing-external-state.json");
+  const previousConfig = process.env.HERDR_BROWSER_CONFIG;
+  const previousState = process.env.HERDR_BROWSER_DAEMON_STATE;
+  const previousCdp = process.env.HERDR_BROWSER_CDP_URL;
+  try {
+    await writeFile(configPath, JSON.stringify({ cdpUrl: "http://localhost:9222/" }));
+    process.env.HERDR_BROWSER_CONFIG = configPath;
+    process.env.HERDR_BROWSER_DAEMON_STATE = explicitState;
+    delete process.env.HERDR_BROWSER_CDP_URL;
+    resetBrowserConfigAppliedForTest();
+
+    await expect(status()).rejects.toThrow("browser daemon is not running");
+    expect(String(process.env.HERDR_BROWSER_CDP_URL)).toBe("http://127.0.0.1:9222");
+    expect(await stopDaemon()).toBe(false);
+  } finally {
+    resetBrowserConfigAppliedForTest();
+    if (previousConfig === undefined) delete process.env.HERDR_BROWSER_CONFIG;
+    else process.env.HERDR_BROWSER_CONFIG = previousConfig;
+    if (previousState === undefined) delete process.env.HERDR_BROWSER_DAEMON_STATE;
+    else process.env.HERDR_BROWSER_DAEMON_STATE = previousState;
+    if (previousCdp === undefined) delete process.env.HERDR_BROWSER_CDP_URL;
+    else process.env.HERDR_BROWSER_CDP_URL = previousCdp;
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

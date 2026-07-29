@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { configuredBrowserCdpUrl, normalizeCdpHttpUrl } from "./cdpUrl";
+
 export function projectRoot(): string {
   return dirname(dirname(fileURLToPath(import.meta.url)));
 }
@@ -13,11 +15,47 @@ export function daemonStateFile(env: NodeJS.ProcessEnv = process.env): string {
     return env.HERDR_BROWSER_DAEMON_STATE;
   }
   const stateDir = browserStateDir(env);
-  const session = env.HERDR_SESSION?.trim();
-  if (session) {
-    return join(stateDir, `daemon-${safeFilenamePart(session)}.json`);
+  const namespace = daemonStateNamespace(env);
+  if (namespace) {
+    return join(stateDir, `daemon-${namespace}.json`);
   }
   return join(stateDir, "daemon.json");
+}
+
+/**
+ * Filename-safe namespace under the plugin state dir so distinct Herdr sessions
+ * never share a daemon, and multiple external CDP endpoints within one session
+ * do not collide on the state file. Owned launch keeps the legacy session-only
+ * path. Profile directories are intentionally not namespaced by CDP — external
+ * mode does not own a local Chrome profile.
+ */
+export function daemonStateNamespace(env: NodeJS.ProcessEnv = process.env): string | null {
+  const session = env.HERDR_SESSION?.trim();
+  const cdpUrl = externalCdpUrlForNamespace(env);
+  if (!session && !cdpUrl) {
+    return null;
+  }
+  if (session && !cdpUrl) {
+    return safeFilenamePart(session);
+  }
+  if (!session && cdpUrl) {
+    return safeFilenamePart(`cdp-${cdpEndpointKey(cdpUrl)}`);
+  }
+  return safeFilenamePart(`${session}__cdp-${cdpEndpointKey(cdpUrl!)}`);
+}
+
+/** Stable short key for a canonical external CDP HTTP endpoint. */
+export function cdpEndpointKey(cdpUrl: string): string {
+  const normalized = normalizeCdpHttpUrl(cdpUrl);
+  const parsed = new URL(normalized);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return safeFilenamePart(`${parsed.hostname}:${port}`);
+}
+
+function externalCdpUrlForNamespace(env: NodeJS.ProcessEnv): string | null {
+  // configuredBrowserCdpUrl throws on invalid input — fail before any spawn path
+  // can use a colliding or non-loopback state file.
+  return configuredBrowserCdpUrl(env);
 }
 
 function herdrPluginStateDir(env: NodeJS.ProcessEnv): string {

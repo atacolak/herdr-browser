@@ -7,6 +7,7 @@ import {
   chromeProfileDir,
   ensurePrivateParentDir,
 } from "./paths";
+import { configuredBrowserCdpUrl, normalizeCdpHttpUrl } from "./cdpUrl";
 import { DEFAULT_CAPTURE_BACKEND, configuredCaptureBackend } from "./captureBackend";
 import {
   DEFAULT_SCREENCAST_EVERY_NTH_FRAME,
@@ -111,6 +112,7 @@ export async function heartbeatView(viewId: string, paneId?: string): Promise<vo
 }
 
 export async function listViews(): Promise<BrowserViewListResponse> {
+  await ensureBrowserConfigApplied();
   const state = await readDaemonState();
   if (!state || !await isAlive(state)) {
     return { ok: true, views: [] };
@@ -126,6 +128,7 @@ export async function listViews(): Promise<BrowserViewListResponse> {
 }
 
 export async function closeView(viewId: string): Promise<void> {
+  await ensureBrowserConfigApplied();
   const state = await readDaemonState();
   if (!state) {
     return;
@@ -334,6 +337,7 @@ export async function waitForExpression(
 }
 
 export async function stopDaemon(): Promise<boolean> {
+  await ensureBrowserConfigApplied();
   const state = await readDaemonState();
   if (!state) {
     return false;
@@ -375,6 +379,11 @@ async function ensureBrowserConfigApplied(): Promise<void> {
     applyBrowserConfigEnv(config);
   });
   await browserConfigApplied;
+}
+
+/** Test-only reset for module-global config memoization. */
+export function resetBrowserConfigAppliedForTest(): void {
+  browserConfigApplied = null;
 }
 
 async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
@@ -501,6 +510,7 @@ async function isAlive(state: DaemonState): Promise<boolean> {
 // metrics) use this instead of ensureDaemon: it reads the last known state
 // and fails cleanly rather than spawning a new daemon + Chrome.
 async function requireRunningDaemon(): Promise<DaemonState> {
+  await ensureBrowserConfigApplied();
   const state = await readDaemonState();
   if (!state || !await isAlive(state)) {
     throw new Error("browser daemon is not running");
@@ -578,8 +588,30 @@ export function daemonConfigMatches(state: DaemonState): boolean {
   const cadenceMatches =
     (state.screencastEveryNthFrame ?? DEFAULT_SCREENCAST_EVERY_NTH_FRAME) ===
     configuredScreencastEveryNthFrame();
-  const profileMatches = state.profileDir === chromeProfileDir();
-  return captureBackendMatches && cadenceMatches && profileMatches;
+  const cdpMatches = configuredBrowserCdpUrl() === normalizedDaemonCdpUrl(state);
+  // External attach has no local profile; skip profile identity for that mode.
+  const external = state.chromeOwnership === "external" || configuredBrowserCdpUrl() !== null;
+  const profileMatches = external
+    ? true
+    : state.profileDir === chromeProfileDir();
+  return captureBackendMatches && cadenceMatches && profileMatches && cdpMatches;
+}
+
+function normalizedDaemonCdpUrl(state: DaemonState): string | null {
+  // Owned and legacy daemons never attach externally, regardless of a stale
+  // cdpUrl field that might have been written by an older build.
+  if (state.chromeOwnership !== "external") {
+    return null;
+  }
+  const raw = state.cdpUrl?.trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return normalizeCdpHttpUrl(raw);
+  } catch {
+    return null;
+  }
 }
 
 async function readDaemonState(): Promise<DaemonState | null> {

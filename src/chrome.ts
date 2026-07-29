@@ -5,7 +5,10 @@ import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { createServer } from "node:net";
 import type { Readable } from "node:stream";
 
+import { configuredBrowserCdpUrl, normalizeCdpHttpUrl } from "./cdpUrl";
 import { chromeProfileDir, ensurePrivateDir } from "./paths";
+
+export { configuredBrowserCdpUrl, normalizeCdpHttpUrl } from "./cdpUrl";
 
 const CHROME_CANDIDATES = [
   "google-chrome-stable",
@@ -15,22 +18,53 @@ const CHROME_CANDIDATES = [
   "chrome",
 ];
 
-export type ChromeInstance = {
+export type ChromeOwnership = "owned" | "external";
+
+type OwnedChromeProcess = ChildProcessByStdio<null, null, Readable>;
+
+type ChromeBase = {
+  ownership: ChromeOwnership;
   executable: string;
   port: number;
-  profileDir: string;
-  process: ChromeProcess;
   browserWebSocketUrl: string;
-  /** Recent stderr lines kept for crash diagnostics; bounded, not the full history. */
+  /** Recent stderr lines kept for crash diagnostics; empty for external attach. */
   recentStderr: () => string;
+  /** Owned mode kills Chrome. External mode is disconnect-only. */
   close: () => Promise<void>;
 };
 
-type ChromeProcess = ChildProcessByStdio<null, null, Readable>;
+/** Plugin-launched Chrome: real child process and local profile. */
+export type OwnedChromeInstance = ChromeBase & {
+  ownership: "owned";
+  profileDir: string;
+  child: OwnedChromeProcess;
+};
+
+/** Externally owned CDP endpoint: no child, no local profile, never killed. */
+export type ExternalChromeInstance = ChromeBase & {
+  ownership: "external";
+  /** Canonical loopback CDP HTTP base used for attach. */
+  cdpUrl: string;
+  profileDir: null;
+  child: null;
+};
+
+export type ChromeInstance = OwnedChromeInstance | ExternalChromeInstance;
 
 const STDERR_RING_BUFFER_MAX_LINES = 20;
 
-export async function launchChrome(): Promise<ChromeInstance> {
+/** Launch owned Chrome, or attach when HERDR_BROWSER_CDP_URL is set. */
+export async function resolveChrome(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ChromeInstance> {
+  const cdpUrl = configuredBrowserCdpUrl(env);
+  if (cdpUrl) {
+    return await connectExternalChrome(cdpUrl);
+  }
+  return await launchChrome();
+}
+
+export async function launchChrome(): Promise<OwnedChromeInstance> {
   const executable = await findChromeExecutable();
   const port = await findFreePort();
   const profileDir = chromeProfileDir();
@@ -98,14 +132,130 @@ export async function launchChrome(): Promise<ChromeInstance> {
   chrome.stderr.on("data", (chunk: Buffer) => stderrRing.append(chunk.toString()));
 
   return {
+    ownership: "owned",
     executable,
     port,
     profileDir,
-    process: chrome,
+    child: chrome,
     browserWebSocketUrl,
     recentStderr: () => stderrRing.snapshot(),
     close,
   };
+}
+
+/**
+ * Attach to a browser that already exposes CDP HTTP (`/json/version`).
+ * Never launches or kills the remote browser. Death is observed via the
+ * browser websocket `onClose` path after connect, not via process polling.
+ */
+export async function connectExternalChrome(
+  cdpHttpUrl: string,
+): Promise<ExternalChromeInstance> {
+  const baseUrl = normalizeCdpHttpUrl(cdpHttpUrl);
+  const version = await fetchBrowserVersion(baseUrl);
+  const advertisedWebSocketUrl = version.webSocketDebuggerUrl;
+  if (!advertisedWebSocketUrl) {
+    throw new Error(`external CDP endpoint did not advertise webSocketDebuggerUrl: ${baseUrl}`);
+  }
+  const browserWebSocketUrl = externalBrowserWebSocketUrl(baseUrl, advertisedWebSocketUrl);
+
+  return {
+    ownership: "external",
+    executable: version.Browser ?? "external-chrome",
+    port: portFromUrl(baseUrl),
+    cdpUrl: baseUrl,
+    profileDir: null,
+    child: null,
+    browserWebSocketUrl,
+    recentStderr: () => "",
+    close: async () => {
+      // External browsers are not owned; never kill them.
+    },
+  };
+}
+
+/**
+ * HTTP base used for Chrome `/json/*` upstreams (list refresh, view gateway).
+ * External attach preserves the canonical configured endpoint (host + scheme);
+ * owned launch always talks to the local debugging port on 127.0.0.1.
+ */
+export function externalBrowserWebSocketUrl(
+  configuredCdpUrl: string,
+  advertisedWebSocketUrl: string,
+): string {
+  const configured = new URL(normalizeCdpHttpUrl(configuredCdpUrl));
+  let advertised: URL;
+  try {
+    advertised = new URL(advertisedWebSocketUrl);
+  } catch {
+    throw new Error(
+      `external CDP endpoint advertised an invalid webSocketDebuggerUrl: ${advertisedWebSocketUrl}`,
+    );
+  }
+  if (advertised.protocol !== "ws:" && advertised.protocol !== "wss:") {
+    throw new Error(
+      `external CDP endpoint advertised a non-WebSocket debugger URL: ${advertisedWebSocketUrl}`,
+    );
+  }
+  if (!advertised.pathname.startsWith("/devtools/browser/")) {
+    throw new Error(
+      `external CDP endpoint advertised an invalid browser WebSocket path: ${advertised.pathname}`,
+    );
+  }
+
+  // Trust only the browser path returned by Chrome. The configured endpoint is
+  // the authority boundary: an internal, stale, or malicious advertised host
+  // must not redirect the client away from the validated CDP host and port.
+  configured.protocol = "ws:";
+  configured.pathname = advertised.pathname;
+  configured.search = "";
+  configured.hash = "";
+  return configured.toString();
+}
+
+export function chromeCdpHttpUrl(chrome: ChromeInstance): string {
+  if (chrome.ownership === "external") {
+    return chrome.cdpUrl;
+  }
+  return `http://127.0.0.1:${chrome.port}`;
+}
+
+function portFromUrl(url: string): number {
+  const parsed = new URL(url);
+  if (parsed.port) {
+    return Number.parseInt(parsed.port, 10);
+  }
+  return parsed.protocol === "https:" ? 443 : 80;
+}
+
+async function fetchBrowserVersion(baseUrl: string): Promise<{
+  webSocketDebuggerUrl?: string;
+  Browser?: string;
+}> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < 10_000) {
+    try {
+      const response = await fetch(`${baseUrl}/json/version`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (response.ok) {
+        return await response.json() as {
+          webSocketDebuggerUrl?: string;
+          Browser?: string;
+        };
+      }
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(
+    `timed out waiting for external CDP endpoint ${baseUrl}/json/version: ${
+      lastError instanceof Error ? lastError.message : String(lastError ?? "")
+    }`,
+  );
 }
 
 function createStderrRingBuffer(maxLines: number): { append: (chunk: string) => void; snapshot: () => string } {
@@ -129,7 +279,7 @@ function createStderrRingBuffer(maxLines: number): { append: (chunk: string) => 
   };
 }
 
-async function waitForChromeExit(chrome: ChromeProcess, timeoutMs: number): Promise<boolean> {
+async function waitForChromeExit(chrome: OwnedChromeProcess, timeoutMs: number): Promise<boolean> {
   if (hasChromeExited(chrome)) {
     return true;
   }
@@ -147,7 +297,7 @@ async function waitForChromeExit(chrome: ChromeProcess, timeoutMs: number): Prom
 }
 
 export function hasChromeExited(
-  chrome: Pick<ChromeProcess, "exitCode" | "signalCode">,
+  chrome: Pick<OwnedChromeProcess, "exitCode" | "signalCode">,
 ): boolean {
   return chrome.exitCode !== null || chrome.signalCode !== null;
 }
@@ -210,7 +360,7 @@ async function findFreePort(): Promise<number> {
 
 async function waitForBrowserWebSocketUrl(
   port: number,
-  chrome: ChromeProcess,
+  chrome: OwnedChromeProcess,
 ): Promise<string> {
   let stderr = "";
   const onData = (chunk: Buffer) => {
