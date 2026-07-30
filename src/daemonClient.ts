@@ -18,6 +18,7 @@ import type {
   BrowserViewResponse,
   BrowserViewListResponse,
   BrowserViewSelectionResponse,
+  CapabilitiesResponse,
   DaemonHealth,
   DaemonState,
   DaemonStatus,
@@ -43,6 +44,8 @@ import type {
   WaitResponse,
   WheelResponse,
 } from "./daemonProtocol";
+import { browserCapabilities } from "./daemonProtocol";
+import { configuredBrowserMode } from "./targetState";
 import type { BrowserKeyboardInput } from "./browser";
 import { applyBrowserConfigEnv, loadConfig } from "./config";
 import { reapStaleChrome } from "./staleChrome";
@@ -142,6 +145,31 @@ export async function closeView(viewId: string): Promise<void> {
 export async function status(): Promise<DaemonStatus> {
   const state = await requireRunningDaemon();
   return await request<DaemonStatus>(state, "GET", "/status");
+}
+
+/** Static capability advertisement. Works offline; prefers live daemon when up. */
+export async function capabilities(): Promise<CapabilitiesResponse> {
+  try {
+    const state = await readDaemonState();
+    if (state) {
+      return await request<CapabilitiesResponse>(
+        state,
+        "GET",
+        "/capabilities",
+        undefined,
+        DAEMON_REQUEST_TIMEOUT_MS,
+        null,
+      );
+    }
+  } catch {
+    // Fall through to the static offline contract.
+  }
+  return {
+    ok: true,
+    plugin: "herdr-browser",
+    mode: configuredBrowserMode(),
+    capabilities: browserCapabilities(),
+  };
 }
 
 export async function health(): Promise<DaemonHealth> {

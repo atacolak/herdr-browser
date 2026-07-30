@@ -9,6 +9,17 @@ import {
 } from "./captureBackend";
 import { configuredScreencastEveryNthFrame } from "./screencastCadence";
 import { ScreencastAckPacer, type ScreencastCapacityGate } from "./screencastAckPacer";
+import {
+  assertTargetStateGenerations,
+  configuredBrowserMode,
+  configuredTargetStatePath,
+  followBrowserActiveTargetState,
+  generationBoundFromState,
+  readBrowserActiveTargetState,
+  type BrowserActiveTargetState,
+  type BrowserMode,
+  type GenerationBound,
+} from "./targetState";
 
 type CreateTargetResult = {
   targetId: string;
@@ -121,8 +132,18 @@ export type BrowserSession = {
   tabs: Map<string, BrowserTab>;
   attachPromises: Map<string, Promise<BrowserTab | null>>;
   viewport: BrowserViewport | null;
+  /** default = owned/sidecar control; observe_mirror = attach-only follow mode */
+  mode: BrowserMode;
+  observeMirror: ObserveMirrorState | null;
   closed: boolean;
   close: () => Promise<void>;
+};
+
+type ObserveMirrorState = {
+  targetStatePath: string;
+  boundGenerations: GenerationBound;
+  lastSequence: number;
+  stopFollower: (() => void) | null;
 };
 
 export type BrowserRuntime = {
@@ -291,15 +312,33 @@ export async function createBrowserRuntime(
         if (!owner) {
           return;
         }
-        runtime.targetOwners.set(targetInfo.targetId, owner);
         const view = runtime.views.get(owner);
-        if (view) {
-          void ensurePageTargetAttached(view, targetInfo, true).catch(() => {});
+        // Observe-mirror views only follow externally published target state; never
+        // auto-claim popups/opener descendants (that would expand attach scope).
+        if (!view || view.mode === "observe_mirror") {
+          return;
         }
+        runtime.targetOwners.set(targetInfo.targetId, owner);
+        void ensurePageTargetAttached(view, targetInfo, true).catch(() => {});
       }),
       cdp.on("Target.targetInfoChanged", (params) => {
         const targetInfo = targetInfoFromEvent(params);
         if (!targetInfo) {
+          return;
+        }
+        // Always refresh local metadata for every view already tracking this
+        // target. Observe-mirror must pick up same-target navigations even if
+        // ownership bookkeeping is momentarily incomplete.
+        let tracked = false;
+        for (const view of runtime.views.values()) {
+          const tab = view.tabs.get(targetInfo.targetId);
+          if (!tab) {
+            continue;
+          }
+          tab.info = normalizedTargetInfo(targetInfo);
+          tracked = true;
+        }
+        if (tracked) {
           return;
         }
         const owner = runtime.targetOwners.get(targetInfo.targetId) ??
@@ -307,16 +346,12 @@ export async function createBrowserRuntime(
         if (!owner) {
           return;
         }
-        runtime.targetOwners.set(targetInfo.targetId, owner);
         const view = runtime.views.get(owner);
-        if (!view) {
+        if (!view || view.mode === "observe_mirror") {
+          // Observe-mirror never auto-attaches from bare targetInfoChanged.
           return;
         }
-        const tab = view.tabs.get(targetInfo.targetId);
-        if (tab) {
-          tab.info = normalizedTargetInfo(targetInfo);
-          return;
-        }
+        runtime.targetOwners.set(targetInfo.targetId, owner);
         void ensurePageTargetAttached(view, targetInfo, targetInfo.targetId !== view.targetId).catch(() => {});
       }),
       cdp.on("Target.targetDestroyed", (params) => {
@@ -352,6 +387,7 @@ export async function createBrowserView(
   if (runtime.views.has(id)) {
     throw new Error(`browser view already exists: ${id}`);
   }
+  const mode = configuredBrowserMode();
   const session: BrowserSession = {
     id,
     runtime,
@@ -364,12 +400,18 @@ export async function createBrowserView(
     tabs: new Map(),
     attachPromises: new Map(),
     viewport: null,
+    mode,
+    observeMirror: null,
     closed: false,
     close: async () => await closeBrowserView(session),
   };
   runtime.views.set(id, session);
   let createdTargetId: string | null = null;
   try {
+    if (mode === "observe_mirror") {
+      await startObserveMirrorView(session);
+      return session;
+    }
     const created = await runtime.cdp.send<CreateTargetResult>("Target.createTarget", {
       url: initialUrl,
     });
@@ -384,6 +426,7 @@ export async function createBrowserView(
     return session;
   } catch (error) {
     runtime.views.delete(id);
+    stopObserveMirrorFollower(session);
     if (createdTargetId) {
       runtime.targetOwners.delete(createdTargetId);
       await runtime.cdp.send("Target.closeTarget", { targetId: createdTargetId }, undefined, 1_000).catch(() => {});
@@ -397,10 +440,12 @@ export async function closeBrowserView(session: BrowserSession): Promise<void> {
     return;
   }
   session.closed = true;
+  stopObserveMirrorFollower(session);
   await stopActiveScreencast(session);
   const targetIds = [...session.runtime.targetOwners]
     .filter(([, owner]) => owner === session.id)
     .map(([targetId]) => targetId);
+  const closeOwnedTargets = session.mode !== "observe_mirror";
   for (const targetId of targetIds) {
     session.runtime.targetOwners.delete(targetId);
     const tab = session.tabs.get(targetId);
@@ -408,10 +453,259 @@ export async function closeBrowserView(session: BrowserSession): Promise<void> {
       cleanupTab(tab);
       session.tabs.delete(targetId);
     }
-    await session.cdp.send("Target.closeTarget", { targetId }, undefined, 1_000).catch(() => {});
+    // Observe-mirror never owns targets: detach is local only.
+    if (closeOwnedTargets) {
+      await session.cdp.send("Target.closeTarget", { targetId }, undefined, 1_000).catch(() => {});
+    } else {
+      await session.cdp.send("Target.detachFromTarget", { targetId }, undefined, 1_000).catch(() => {});
+    }
   }
   session.targetId = "";
   session.sessionId = "";
+}
+
+export function isObserveMirrorSession(session: BrowserSession): boolean {
+  return session.mode === "observe_mirror";
+}
+
+function observeMirrorMutationError(action: string): Error {
+  return new Error(`observe_mirror mode is read-only: ${action} is disabled`);
+}
+
+function assertMutableSession(session: BrowserSession, action: string): void {
+  if (session.mode === "observe_mirror") {
+    throw observeMirrorMutationError(action);
+  }
+}
+
+async function startObserveMirrorView(session: BrowserSession): Promise<void> {
+  if (session.chrome.ownership !== "external") {
+    throw new Error(
+      "observe_mirror requires external CDP attach (set HERDR_BROWSER_CDP_URL)",
+    );
+  }
+  const targetStatePath = configuredTargetStatePath();
+  if (!targetStatePath) {
+    throw new Error(
+      "observe_mirror requires HERDR_BROWSER_TARGET_STATE path to active-target JSON",
+    );
+  }
+  const initial = await readBrowserActiveTargetState(targetStatePath);
+  session.observeMirror = {
+    targetStatePath,
+    boundGenerations: generationBoundFromState(initial),
+    lastSequence: initial.seq,
+    stopFollower: null,
+  };
+  await applyObserveMirrorState(session, initial);
+  const follower = followBrowserActiveTargetState(targetStatePath, {
+    onState: async (state) => {
+      if (session.closed || session.mode !== "observe_mirror" || !session.observeMirror) {
+        return;
+      }
+      if (state.seq <= session.observeMirror.lastSequence) {
+        return;
+      }
+      try {
+        await applyObserveMirrorState(session, state);
+      } catch (error) {
+        console.error(
+          "herdr-browser: observe_mirror reattach failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    },
+    onError: (error) => {
+      // Transient read races during atomic rename are expected; keep following.
+      if (/ENOENT|invalid target state JSON|JSON/i.test(error.message)) {
+        return;
+      }
+      console.error("herdr-browser: observe_mirror target-state error:", error.message);
+    },
+  });
+  session.observeMirror.stopFollower = follower.stop;
+}
+
+async function applyObserveMirrorState(
+  session: BrowserSession,
+  state: BrowserActiveTargetState,
+): Promise<void> {
+  if (!session.observeMirror) {
+    throw new Error("observe mirror state missing");
+  }
+  assertTargetStateGenerations(state, session.observeMirror.boundGenerations);
+  // Bind generations from the first snapshot that carries them.
+  session.observeMirror.boundGenerations = {
+    ...session.observeMirror.boundGenerations,
+    ...generationBoundFromState(state),
+  };
+  session.observeMirror.lastSequence = state.seq;
+
+  const targetId = state.active_target_id;
+  if (!targetId) {
+    await mirrorDetachAll(session);
+    return;
+  }
+
+  if (session.targetId === targetId && session.tabs.has(targetId)) {
+    // Same target: follow navigation/metadata without reattach. Prefer
+    // published page fields, then refresh from CDP target info so toolbar
+    // URL/title stay current even when the publisher omits title.
+    await refreshObserveMirrorTabInfo(session, targetId, state);
+    return;
+  }
+
+  await mirrorAttachTarget(session, targetId, state);
+}
+
+async function refreshObserveMirrorTabInfo(
+  session: BrowserSession,
+  targetId: string,
+  state?: BrowserActiveTargetState,
+): Promise<void> {
+  const tab = session.tabs.get(targetId);
+  if (!tab) {
+    return;
+  }
+
+  // Publisher fields win when present (same-target navigation follow).
+  if (state?.page?.url !== undefined && state.page.url.length > 0) {
+    tab.info.url = state.page.url;
+  }
+  if (state?.page?.title !== undefined) {
+    tab.info.title = state.page.title;
+  }
+
+  const hasPublishedUrl = typeof state?.page?.url === "string" && state.page.url.length > 0;
+  const hasPublishedTitle = typeof state?.page?.title === "string";
+  const needsCdpRefresh =
+    !hasPublishedUrl ||
+    !hasPublishedTitle ||
+    !tab.info.url ||
+    tab.info.url === "about:blank";
+  if (!needsCdpRefresh) {
+    return;
+  }
+
+  try {
+    const response = await session.cdp.send<{ targetInfo?: CdpTargetInfo }>(
+      "Target.getTargetInfo",
+      { targetId },
+      undefined,
+      1_000,
+    );
+    if (response.targetInfo) {
+      const info = normalizedTargetInfo(response.targetInfo);
+      // Never clobber a good published/local URL with blank CDP lag.
+      if (info.url && (!tab.info.url || tab.info.url === "about:blank" || !hasPublishedUrl)) {
+        if (!(hasPublishedUrl && info.url === "about:blank")) {
+          tab.info.url = info.url;
+        }
+      }
+      if (info.title && (!hasPublishedTitle || !tab.info.title)) {
+        tab.info.title = info.title;
+      }
+      if (info.type) {
+        tab.info.type = info.type;
+      }
+    }
+  } catch {
+    // Best-effort; page events / later target-state pubs still update metadata.
+  }
+
+  // Re-assert publisher fields last so CDP cannot win a race against them.
+  if (state?.page?.url !== undefined && state.page.url.length > 0) {
+    tab.info.url = state.page.url;
+  }
+  if (state?.page?.title !== undefined) {
+    tab.info.title = state.page.title;
+  }
+}
+
+async function mirrorDetachAll(session: BrowserSession): Promise<void> {
+  await stopActiveScreencast(session);
+  const previousIds = [...session.tabs.keys()];
+  for (const previousId of previousIds) {
+    session.runtime.targetOwners.delete(previousId);
+    const previous = session.tabs.get(previousId);
+    if (previous) {
+      cleanupTab(previous);
+      session.tabs.delete(previousId);
+    }
+    await session.cdp.send("Target.detachFromTarget", { targetId: previousId }, undefined, 1_000)
+      .catch(() => {});
+  }
+  session.targetId = "";
+  session.sessionId = "";
+}
+
+async function mirrorAttachTarget(
+  session: BrowserSession,
+  targetId: string,
+  state: BrowserActiveTargetState,
+): Promise<void> {
+  // Drop previous mirrored target locally without Target.closeTarget.
+  const previousIds = [...session.tabs.keys()].filter((id) => id !== targetId);
+  for (const previousId of previousIds) {
+    session.runtime.targetOwners.delete(previousId);
+    const previous = session.tabs.get(previousId);
+    if (previous) {
+      cleanupTab(previous);
+      session.tabs.delete(previousId);
+    }
+    await session.cdp.send("Target.detachFromTarget", { targetId: previousId }, undefined, 1_000)
+      .catch(() => {});
+  }
+
+  const pageUrl = state.page?.url ?? "";
+  const pageTitle = state.page?.title ?? "";
+
+  let targetInfo: CdpTargetInfo;
+  try {
+    const response = await session.cdp.send<{ targetInfo?: CdpTargetInfo }>(
+      "Target.getTargetInfo",
+      { targetId },
+    );
+    if (!response.targetInfo || response.targetInfo.type !== "page") {
+      throw new Error(`observe_mirror target is not a page: ${targetId}`);
+    }
+    targetInfo = normalizedTargetInfo(response.targetInfo);
+  } catch (error) {
+    if (isTargetGoneError(error)) {
+      throw new Error(`observe_mirror target not found: ${targetId}`);
+    }
+    // Fall back to sparse info from the state file when getTargetInfo is flaky.
+    targetInfo = {
+      targetId,
+      type: "page",
+      title: pageTitle,
+      url: pageUrl,
+    };
+  }
+  if (state.page?.url !== undefined) {
+    targetInfo.url = state.page.url;
+  }
+  if (state.page?.title !== undefined) {
+    targetInfo.title = state.page.title;
+  }
+
+  session.runtime.targetOwners.set(targetId, session.id);
+  try {
+    const tab = await ensurePageTargetAttached(session, targetInfo, true);
+    if (!tab) {
+      throw new Error(`failed to attach observe_mirror target: ${targetId}`);
+    }
+  } catch (error) {
+    session.runtime.targetOwners.delete(targetId);
+    throw error;
+  }
+}
+
+function stopObserveMirrorFollower(session: BrowserSession): void {
+  session.observeMirror?.stopFollower?.();
+  if (session.observeMirror) {
+    session.observeMirror.stopFollower = null;
+  }
 }
 
 async function ensurePageTargetAttached(
@@ -470,9 +764,16 @@ async function attachPageTarget(
       session.closed ||
       session.runtime.targetOwners.get(targetInfo.targetId) !== session.id
     ) {
-      await session.cdp.send("Target.closeTarget", {
-        targetId: targetInfo.targetId,
-      }, undefined, 1_000).catch(() => {});
+      // Never close foreign targets from a raced attach; detach at most.
+      if (session.mode === "observe_mirror") {
+        await session.cdp.send("Target.detachFromTarget", {
+          targetId: targetInfo.targetId,
+        }, undefined, 1_000).catch(() => {});
+      } else {
+        await session.cdp.send("Target.closeTarget", {
+          targetId: targetInfo.targetId,
+        }, undefined, 1_000).catch(() => {});
+      }
       return null;
     }
     const tab: BrowserTab = {
@@ -528,8 +829,32 @@ function installPageEventHandlers(session: BrowserSession, tab: BrowserTab): voi
         timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now(),
       });
     }),
+    session.cdp.on(`${tab.sessionId}:Page.frameNavigated`, (params) => {
+      const frame = (params as { frame?: { id?: unknown; parentId?: unknown; url?: unknown } }).frame;
+      if (!frame || frame.parentId) {
+        return; // main frame only
+      }
+      if (typeof frame.url === "string") {
+        tab.info.url = frame.url;
+      }
+    }),
+    session.cdp.on(`${tab.sessionId}:Page.navigatedWithinDocument`, (params) => {
+      const url = (params as { url?: unknown }).url;
+      if (typeof url === "string") {
+        tab.info.url = url;
+      }
+    }),
     session.cdp.on(`${tab.sessionId}:Page.loadEventFired`, () => {
-      if (session.targetId !== tab.targetId || session.viewport?.pageScaleFactor === undefined) {
+      // Observe-mirror: refresh title/url from target info after loads so the
+      // toolbar tracks page navigations on the same target id.
+      if (session.mode === "observe_mirror" && session.targetId === tab.targetId) {
+        void refreshObserveMirrorTabInfo(session, tab.targetId).catch(() => {});
+        return;
+      }
+      if (
+        session.targetId !== tab.targetId ||
+        session.viewport?.pageScaleFactor === undefined
+      ) {
         return;
       }
       void applyPageScale(session, tab.sessionId, session.viewport.pageScaleFactor).catch(() => {});
@@ -553,6 +878,7 @@ function installPageEventHandlers(session: BrowserSession, tab: BrowserTab): voi
 }
 
 export async function navigate(session: BrowserSession, url: string): Promise<BrowserNavigationResult> {
+  assertMutableSession(session, "navigate");
   boostScreencast(session);
   const load = waitForLoadEvent(session);
   await session.cdp.send("Page.navigate", { url }, session.sessionId, 3_000);
@@ -568,14 +894,17 @@ export async function navigate(session: BrowserSession, url: string): Promise<Br
 }
 
 export async function goBack(session: BrowserSession): Promise<BrowserNavigationResult> {
+  assertMutableSession(session, "goBack");
   return await navigateHistory(session, -1);
 }
 
 export async function goForward(session: BrowserSession): Promise<BrowserNavigationResult> {
+  assertMutableSession(session, "goForward");
   return await navigateHistory(session, 1);
 }
 
 export async function reloadPage(session: BrowserSession): Promise<BrowserNavigationResult> {
+  assertMutableSession(session, "reload");
   boostScreencast(session);
   const load = waitForLoadEvent(session);
   await session.cdp.send("Page.reload", {}, session.sessionId);
@@ -591,6 +920,7 @@ export async function reloadPage(session: BrowserSession): Promise<BrowserNaviga
 }
 
 export async function stopLoading(session: BrowserSession): Promise<BrowserNavigationResult> {
+  assertMutableSession(session, "stopLoading");
   boostScreencast(session);
   await session.cdp.send("Page.stopLoading", {}, session.sessionId);
   invalidateScreencast(session);
@@ -612,6 +942,7 @@ export async function createTab(
   session: BrowserSession,
   initialUrl = "about:blank",
 ): Promise<BrowserTabInfo> {
+  assertMutableSession(session, "createTab");
   const created = await session.cdp.send<CreateTargetResult>("Target.createTarget", {
     url: initialUrl,
   });
@@ -644,6 +975,7 @@ export async function claimTab(
   targetId: string,
   activate = true,
 ): Promise<BrowserTabInfo> {
+  assertMutableSession(session, "claimTab");
   const owner = session.runtime.targetOwners.get(targetId);
   if (owner && owner !== session.id) {
     throw new Error(`target belongs to another browser view: ${targetId}`);
@@ -689,6 +1021,7 @@ export async function closeTab(
   session: BrowserSession,
   targetId: string,
 ): Promise<BrowserTabInfo> {
+  assertMutableSession(session, "closeTab");
   if (!session.tabs.has(targetId)) {
     throw new Error(`tab not found: ${targetId}`);
   }
@@ -719,6 +1052,7 @@ export async function switchTab(
   session: BrowserSession,
   targetId: string,
 ): Promise<BrowserTabInfo> {
+  assertMutableSession(session, "switchTab");
   await activateTab(session, targetId);
   const tab = session.tabs.get(targetId);
   if (!tab) {
@@ -844,9 +1178,14 @@ export async function setViewport(
   session: BrowserSession,
   viewport: BrowserViewport,
 ): Promise<void> {
+  // Observe-mirror records local capture geometry only. Never push
+  // Emulation.setDeviceMetricsOverride / setPageScaleFactor — those mutate
+  // the externally owned page layout.
   boostScreencast(session);
   session.viewport = viewport;
-  await applyViewport(session, session.sessionId, viewport);
+  if (session.mode !== "observe_mirror") {
+    await applyViewport(session, session.sessionId, viewport);
+  }
   invalidateScreencast(session);
 }
 
@@ -854,6 +1193,7 @@ export async function clickMouse(
   session: BrowserSession,
   click: BrowserMouseClick,
 ): Promise<void> {
+  assertMutableSession(session, "clickMouse");
   boostScreencast(session);
   const x = Math.max(0, Math.floor(click.x));
   const y = Math.max(0, Math.floor(click.y));
@@ -880,6 +1220,7 @@ export async function moveMouse(
   session: BrowserSession,
   move: BrowserMouseMove,
 ): Promise<void> {
+  assertMutableSession(session, "moveMouse");
   boostScreencast(session);
   const x = Math.max(0, Math.floor(move.x));
   const y = Math.max(0, Math.floor(move.y));
@@ -896,6 +1237,7 @@ export async function nativeSelectAtPoint(
   session: BrowserSession,
   point: BrowserMouseClick,
 ): Promise<BrowserNativeSelectHit> {
+  assertMutableSession(session, "nativeSelectAtPoint");
   const x = Math.max(0, Math.floor(point.x));
   const y = Math.max(0, Math.floor(point.y));
   const value = await evaluate(session, `(() => {
@@ -925,6 +1267,7 @@ export async function wheelMouse(
   session: BrowserSession,
   wheel: BrowserMouseWheel,
 ): Promise<void> {
+  assertMutableSession(session, "wheelMouse");
   boostScreencast(session);
   await session.cdp.send("Input.dispatchMouseEvent", {
     type: "mouseWheel",
@@ -940,6 +1283,7 @@ export async function sendKeyboardInput(
   session: BrowserSession,
   input: BrowserKeyboardInput,
 ): Promise<void> {
+  assertMutableSession(session, "sendKeyboardInput");
   boostScreencast(session);
   if (input.kind === "text") {
     await session.cdp.send("Input.insertText", {
@@ -1353,9 +1697,13 @@ async function activateTab(session: BrowserSession, targetId: string): Promise<v
   await stopActiveScreencast(session);
   session.targetId = tab.targetId;
   session.sessionId = tab.sessionId;
-  await session.cdp.send("Page.bringToFront", {}, tab.sessionId, 1_000).catch(() => {});
-  if (session.viewport) {
-    await applyViewport(session, tab.sessionId, session.viewport).catch(() => {});
+  // Observe-mirror must not steal foreground or rewrite device metrics on the
+  // worker-controlled browser.
+  if (session.mode !== "observe_mirror") {
+    await session.cdp.send("Page.bringToFront", {}, tab.sessionId, 1_000).catch(() => {});
+    if (session.viewport) {
+      await applyViewport(session, tab.sessionId, session.viewport).catch(() => {});
+    }
   }
   boostScreencast(session);
   if (session.screencast.listeners.size > 0) {
@@ -1379,7 +1727,9 @@ async function removeTab(session: BrowserSession, targetId: string): Promise<voi
   const next = session.tabs.values().next().value;
   if (next) {
     await activateTab(session, next.targetId).catch(() => {});
-  } else if (!session.closed) {
+  } else if (!session.closed && session.mode !== "observe_mirror") {
+    // Owned/external sidecar views always keep one live tab. Observe-mirror
+    // waits for the next target-state publication instead of creating one.
     await createTab(session).catch(() => {});
   }
 }
@@ -1396,7 +1746,8 @@ async function applyViewport(
   sessionId: string,
   viewport: BrowserViewport,
 ): Promise<void> {
-  if (!sessionId) {
+  if (!sessionId || session.mode === "observe_mirror") {
+    // Defense in depth: observe_mirror never mutates page layout metrics.
     return;
   }
   await session.cdp.send("Emulation.setDeviceMetricsOverride", {
@@ -1415,6 +1766,9 @@ async function applyPageScale(
   sessionId: string,
   pageScaleFactor: number,
 ): Promise<void> {
+  if (!sessionId || session.mode === "observe_mirror") {
+    return;
+  }
   await session.cdp.send("Emulation.setPageScaleFactor", {
     pageScaleFactor,
   }, sessionId, 3_000);

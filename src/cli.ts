@@ -13,6 +13,7 @@ import { parseArgs } from "./args";
 import {
   automation,
   back,
+  capabilities,
   clickMouse,
   consoleEntries,
   evalExpression,
@@ -199,6 +200,13 @@ async function main() {
     return;
   }
 
+  if (args.command === "capabilities") {
+    // Prefer live daemon probe; always fall back to static offline contract so
+    // External controllers can verify observe_mirror support without a running pane.
+    console.log(JSON.stringify(await capabilities(), null, 2));
+    return;
+  }
+
   if (args.command === "tabs") {
     const response = await status();
     console.log(JSON.stringify({ ok: true, tabs: response.tabs }, null, 2));
@@ -265,6 +273,7 @@ Usage:
   herdr-browser automation
   herdr-browser screenshot [url] --output path
   herdr-browser status
+  herdr-browser capabilities
   herdr-browser tabs
   herdr-browser switch-tab <targetId>
   herdr-browser stop
@@ -272,6 +281,8 @@ Usage:
 Environment:
   HERDR_BROWSER_CHROME  Chrome/Chromium executable path
   HERDR_BROWSER_CDP_URL  attach to external CDP HTTP endpoint (no launch/kill)
+  HERDR_BROWSER_MODE  default | observe_mirror (attach-only follow of target state)
+  HERDR_BROWSER_TARGET_STATE  path to active-target JSON (observe_mirror)
   HERDR_BROWSER_DAEMON_STATE  daemon state file override
 `);
 }

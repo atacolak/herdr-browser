@@ -5,8 +5,11 @@ import type {
   BrowserNavigationResult,
   BrowserTabInfo,
 } from "./browser";
+import type { BrowserMode } from "./targetState";
+import { TARGET_STATE_SCHEMA_VERSION } from "./targetState";
 
 export type { BrowserTabInfo } from "./browser";
+export type { BrowserMode };
 
 export type ChromeOwnership = "owned" | "external";
 
@@ -58,6 +61,22 @@ export type BrowserViewListResponse = {
   views: BrowserViewInfo[];
 };
 
+export type BrowserCapabilities = {
+  modes: BrowserMode[];
+  observe_mirror: {
+    env: {
+      mode: "HERDR_BROWSER_MODE";
+      target_state: "HERDR_BROWSER_TARGET_STATE";
+      cdp_url: "HERDR_BROWSER_CDP_URL";
+    };
+    read_only: true;
+    mutates_viewport: false;
+    creates_targets: false;
+    closes_targets: false;
+  };
+  target_state_schema_version: typeof TARGET_STATE_SCHEMA_VERSION;
+};
+
 export type DaemonStatus = {
   ok: true;
   pid: number;
@@ -68,7 +87,34 @@ export type DaemonStatus = {
   title: string;
   captureBackend: CaptureBackend;
   tabs: BrowserTabInfo[];
+  mode: BrowserMode;
+  capabilities: BrowserCapabilities;
 };
+
+export type CapabilitiesResponse = {
+  ok: true;
+  plugin: "herdr-browser";
+  mode: BrowserMode;
+  capabilities: BrowserCapabilities;
+};
+
+export function browserCapabilities(): BrowserCapabilities {
+  return {
+    modes: ["default", "observe_mirror"],
+    observe_mirror: {
+      env: {
+        mode: "HERDR_BROWSER_MODE",
+        target_state: "HERDR_BROWSER_TARGET_STATE",
+        cdp_url: "HERDR_BROWSER_CDP_URL",
+      },
+      read_only: true,
+      mutates_viewport: false,
+      creates_targets: false,
+      closes_targets: false,
+    },
+    target_state_schema_version: TARGET_STATE_SCHEMA_VERSION,
+  };
+}
 
 export type AutomationResponse = {
   ok: true;

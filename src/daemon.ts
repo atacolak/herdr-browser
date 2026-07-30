@@ -39,6 +39,7 @@ import {
   switchTab,
   waitForExpression,
   wheelMouse,
+  isObserveMirrorSession,
   type BrowserKey,
   type BrowserKeyboardInput,
   type BrowserSession,
@@ -58,35 +59,37 @@ import {
   type PaneGraphicsPlacement,
   type PaneGraphicsTarget,
 } from "./herdrGraphics";
-import type {
-  DaemonState,
-  DaemonStatus,
-  DaemonMetrics,
-  AutomationResponse,
-  BrowserViewResponse,
-  BrowserViewListResponse,
-  BrowserViewSelectionResponse,
-  DaemonHealth,
-  ErrorResponse,
-  EvalResponse,
-  ConsoleResponse,
-  GraphicsStreamRequest,
-  GraphicsStreamResponse,
-  KeyResponse,
-  NavigationResponse,
-  OpenResponse,
-  MouseMoveResponse,
-  MouseResponse,
-  NativeSelectAtPointResponse,
-  PageTextResponse,
-  SelectorClickResponse,
-  SelectorPressResponse,
-  SelectorTypeResponse,
-  ScreenshotResponse,
-  TabResponse,
-  WaitResponse,
-  ViewportResponse,
-  WheelResponse,
+import {
+  browserCapabilities,
+  type DaemonState,
+  type DaemonStatus,
+  type DaemonMetrics,
+  type AutomationResponse,
+  type BrowserViewResponse,
+  type BrowserViewListResponse,
+  type BrowserViewSelectionResponse,
+  type CapabilitiesResponse,
+  type DaemonHealth,
+  type ErrorResponse,
+  type EvalResponse,
+  type ConsoleResponse,
+  type GraphicsStreamRequest,
+  type GraphicsStreamResponse,
+  type KeyResponse,
+  type NavigationResponse,
+  type OpenResponse,
+  type MouseMoveResponse,
+  type MouseResponse,
+  type NativeSelectAtPointResponse,
+  type PageTextResponse,
+  type SelectorClickResponse,
+  type SelectorPressResponse,
+  type SelectorTypeResponse,
+  type ScreenshotResponse,
+  type TabResponse,
+  type WaitResponse,
+  type ViewportResponse,
+  type WheelResponse,
 } from "./daemonProtocol";
 
 const VIEW_LEASE_MS = 10_000;
@@ -159,6 +162,9 @@ async function main() {
       view.leaseExpiresAt = Date.now() + VIEW_LEASE_MS;
       return view.queue.run(callback);
     };
+    if (isObserveMirrorSession(session)) {
+      throw new Error("automation gateway is disabled in observe_mirror mode");
+    }
     const startup = startCdpViewGateway({
       viewId: session.id,
       cdpHttpUrl: chromeCdpHttpUrl(session.chrome),
@@ -336,6 +342,18 @@ async function main() {
           return json({ ok: true });
         }
 
+        // Static capability probe for external controllers and operators. No active view
+        // required — advertises observe_mirror contract support.
+        if (request.method === "GET" && url.pathname === "/capabilities") {
+          const first = views.values().next().value as DaemonView | undefined;
+          return json({
+            ok: true,
+            plugin: "herdr-browser",
+            mode: first?.session.mode ?? "default",
+            capabilities: browserCapabilities(),
+          } satisfies CapabilitiesResponse);
+        }
+
         const viewId = request.headers.get("x-herdr-browser-view");
         const view = viewId ? views.get(viewId) : undefined;
         if (!view) {
@@ -357,10 +375,15 @@ async function main() {
         view.leaseExpiresAt = Date.now() + VIEW_LEASE_MS;
         const session = view.session;
         const metrics = view.metrics;
+        const observeMirror = isObserveMirrorSession(session);
         const activeSession = <T>(callback: () => Promise<T>): Promise<T> => view.queue.run(callback);
         // Input never waits behind capture/status work sharing `queue`; it
         // only needs to stay ordered relative to other input on this view.
         const activeInput = <T>(callback: () => Promise<T>): Promise<T> => view.inputQueue.run(callback);
+        const rejectObserveMirror = (action: string): Response => json({
+          ok: false,
+          error: `observe_mirror mode is read-only: ${action} is disabled`,
+        }, 403);
         metrics.requests += 1;
         if (request.method === "GET" && url.pathname === "/status") {
           // Served entirely from locally cached target info (kept current by
@@ -381,10 +404,15 @@ async function main() {
             title: info.title,
             captureBackend: configuredCaptureBackend(),
             tabs: cachedTabs(session),
+            mode: session.mode,
+            capabilities: browserCapabilities(),
           } satisfies DaemonStatus);
         }
 
         if (request.method === "POST" && url.pathname === "/tabs/switch") {
+          if (observeMirror) {
+            return rejectObserveMirror("switchTab");
+          }
           const body = await request.json() as { targetId?: string };
           if (!body.targetId) {
             return json({ ok: false, error: "missing targetId" }, 400);
@@ -396,6 +424,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/tabs") {
+          if (observeMirror) {
+            return rejectObserveMirror("createTab");
+          }
           return json(await activeSession(async () => ({
             ok: true,
             ...await createTab(session),
@@ -403,6 +434,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/tabs/close") {
+          if (observeMirror) {
+            return rejectObserveMirror("closeTab");
+          }
           const body = await request.json() as { targetId?: string };
           if (!body.targetId) {
             return json({ ok: false, error: "missing targetId" }, 400);
@@ -414,6 +448,9 @@ async function main() {
         }
 
         if (request.method === "GET" && url.pathname === "/automation") {
+          if (observeMirror) {
+            return rejectObserveMirror("automation gateway");
+          }
           const gateway = await ensureAutomationGateway(view);
           return json(await activeSession(async () => ({
             ok: true,
@@ -426,6 +463,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/open") {
+          if (observeMirror) {
+            return rejectObserveMirror("navigate");
+          }
           const body = await request.json() as { url?: string };
           if (!body.url) {
             return json({ ok: false, error: "missing url" }, 400);
@@ -441,18 +481,30 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/back") {
+          if (observeMirror) {
+            return rejectObserveMirror("goBack");
+          }
           return json(await activeSession(async () => ({ ok: true, ...await goBack(session) } satisfies NavigationResponse)));
         }
 
         if (request.method === "POST" && url.pathname === "/forward") {
+          if (observeMirror) {
+            return rejectObserveMirror("goForward");
+          }
           return json(await activeSession(async () => ({ ok: true, ...await goForward(session) } satisfies NavigationResponse)));
         }
 
         if (request.method === "POST" && url.pathname === "/reload") {
+          if (observeMirror) {
+            return rejectObserveMirror("reload");
+          }
           return json(await activeSession(async () => ({ ok: true, ...await reloadPage(session) } satisfies NavigationResponse)));
         }
 
         if (request.method === "POST" && url.pathname === "/stop-loading") {
+          if (observeMirror) {
+            return rejectObserveMirror("stopLoading");
+          }
           return json(await activeSession(async () => ({ ok: true, ...await stopLoading(session) } satisfies NavigationResponse)));
         }
 
@@ -570,6 +622,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/mouse") {
+          if (observeMirror) {
+            return rejectObserveMirror("clickMouse");
+          }
           const body = await request.json() as {
             x?: number;
             y?: number;
@@ -596,6 +651,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/mouse-move") {
+          if (observeMirror) {
+            return rejectObserveMirror("moveMouse");
+          }
           const body = await request.json() as {
             x?: number;
             y?: number;
@@ -611,6 +669,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/native-select-at") {
+          if (observeMirror) {
+            return rejectObserveMirror("nativeSelectAtPoint");
+          }
           const body = await request.json() as {
             x?: number;
             y?: number;
@@ -627,6 +688,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/wheel") {
+          if (observeMirror) {
+            return rejectObserveMirror("wheelMouse");
+          }
           const body = await request.json() as {
             x?: number;
             y?: number;
@@ -645,6 +709,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/key") {
+          if (observeMirror) {
+            return rejectObserveMirror("sendKeyboardInput");
+          }
           const body = await request.json() as Partial<BrowserKeyboardInput>;
           const input = normalizedKeyboardInput(body);
           if (!input) {
@@ -656,6 +723,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/selector-click") {
+          if (observeMirror) {
+            return rejectObserveMirror("selectorClick");
+          }
           const body = await request.json() as { selector?: string };
           if (!body.selector) {
             return json({ ok: false, error: "missing selector" }, 400);
@@ -666,6 +736,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/type") {
+          if (observeMirror) {
+            return rejectObserveMirror("selectorType");
+          }
           const body = await request.json() as { selector?: string; text?: string };
           if (!body.selector || typeof body.text !== "string") {
             return json({ ok: false, error: "missing selector/text" }, 400);
@@ -676,6 +749,9 @@ async function main() {
         }
 
         if (request.method === "POST" && url.pathname === "/press") {
+          if (observeMirror) {
+            return rejectObserveMirror("selectorPress");
+          }
           const body = await request.json() as { selector?: string | null; key?: string };
           if (!isBrowserKey(body.key)) {
             return json({ ok: false, error: "missing valid key" }, 400);

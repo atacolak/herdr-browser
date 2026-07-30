@@ -78,6 +78,22 @@ test("page rows reserve only browser chrome and enabled diagnostics", () => {
   expect(pageRows(24, true)).toBe(21);
 });
 
+test("observe mirror toolbar labels the pane as OBSERVE without actions", () => {
+  const toolbar = renderToolbar({
+    columns: 80,
+    url: "https://one.test",
+    input: { focused: false, value: "", selectedAll: false },
+    tabs,
+    observeMirror: true,
+  });
+  const [tabRow, controlRow] = toolbar.text.split("\r\n");
+  expect(tabRow).toContain("[OBSERVE]");
+  expect(controlRow).toContain("read-only mirror");
+  expect(toolbar.layout.actions).toEqual([]);
+  expect(tabRow).toHaveLength(80);
+  expect(controlRow).toHaveLength(80);
+});
+
 test("sameStreamParams requires prior params to skip a re-POST", () => {
   const placement = { viewportCol: 0, viewportRow: 2, gridCols: 100, gridRows: 40 };
   const capture = { maxWidth: 800, maxHeight: 600 };

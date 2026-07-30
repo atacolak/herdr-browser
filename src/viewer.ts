@@ -54,6 +54,7 @@ import { parseSgrMouseInput, type MouseMove, type SgrMouseEvent, type TerminalKe
 import type { BrowserTabInfo, DaemonMetrics, DaemonStatus } from "./daemonProtocol";
 import { loadConfig, saveBrowserZoom } from "./config";
 import { WheelDispatcher } from "./wheelDispatcher";
+import { configuredBrowserMode } from "./targetState";
 
 const TOOLBAR_ROWS = 2;
 const RESIZE_POLL_MS = 250;
@@ -100,6 +101,8 @@ type RenderContext = {
   graphicsTransport: GraphicsTransport;
   browserZoom: number;
   showDiagnostics: boolean;
+  /** When true, toolbar shows OBSERVE and all input is ignored. */
+  observeMirror: boolean;
   stopInteractiveInput: (() => void) | null;
   appliedViewport: ViewportMetrics | null;
   cellMetrics: {
@@ -209,6 +212,7 @@ async function main() {
     graphicsTransport: configuredGraphicsTransport(),
     browserZoom: config.browserZoom,
     showDiagnostics: config.showDiagnostics,
+    observeMirror: configuredBrowserMode() === "observe_mirror",
     stopInteractiveInput: null,
     appliedViewport: null,
     cellMetrics: null,
@@ -277,6 +281,7 @@ async function renderOnce(
     url,
     input,
     tabs: info.tabs,
+    observeMirror: context.observeMirror,
   });
 
   process.stdout.write(options.clearScreen ? "\x1b[2J\x1b[H" : "\x1b[H");
@@ -586,6 +591,11 @@ async function watchResize(
             process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
           });
       }, 25);
+      return;
+    }
+    // Observe-mirror is display-only: drop toolbar/page/keyboard input so the
+    // worker browser is never steered from this pane.
+    if (context.observeMirror) {
       return;
     }
     const toolbarActions = toolbarActionsFromMouseEvents(parsed.mouseEvents, current.toolbar);
@@ -1412,10 +1422,15 @@ export function renderToolbar(options: {
   url: string;
   input: UrlInputState;
   tabs: BrowserTabInfo[];
+  observeMirror?: boolean;
 }): {
   text: string;
   layout: ToolbarLayout;
 } {
+  if (options.observeMirror) {
+    return renderObserveToolbar(options);
+  }
+
   const tabParts: string[] = [];
   const controlParts: string[] = [];
   const actions: ToolbarLayout["actions"] = [];
@@ -1500,6 +1515,30 @@ export function renderToolbar(options: {
       actions,
       urlRow: 2,
       urlStartColumn,
+    },
+  };
+}
+
+function renderObserveToolbar(options: {
+  columns: number;
+  url: string;
+  tabs: BrowserTabInfo[];
+}): {
+  text: string;
+  layout: ToolbarLayout;
+} {
+  const active = options.tabs.find((tab) => tab.active) ?? options.tabs[0];
+  const label = active
+    ? compactText(active.title || active.url || "blank", Math.max(8, options.columns - 24))
+    : "waiting for target";
+  const tabRow = statusText(`[OBSERVE] ${label}`, options.columns);
+  const controlRow = statusText(`read-only mirror · ${options.url || "about:blank"}`, options.columns);
+  return {
+    text: `${tabRow}\r\n${controlRow}`,
+    layout: {
+      actions: [],
+      urlRow: 2,
+      urlStartColumn: options.columns + 1,
     },
   };
 }

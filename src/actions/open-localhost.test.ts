@@ -22,6 +22,22 @@ test("open-localhost passes browser config to the new pane", async () => {
         title: "benchmark",
         captureBackend: "screencast",
         tabs: [],
+        mode: "default" as const,
+        capabilities: {
+          modes: ["default", "observe_mirror"] as const,
+          observe_mirror: {
+            env: {
+              mode: "HERDR_BROWSER_MODE" as const,
+              target_state: "HERDR_BROWSER_TARGET_STATE" as const,
+              cdp_url: "HERDR_BROWSER_CDP_URL" as const,
+            },
+            read_only: true as const,
+            mutates_viewport: false as const,
+            creates_targets: false as const,
+            closes_targets: false as const,
+          },
+          target_state_schema_version: 1 as const,
+        },
       }),
       openBrowserPane: (config) => {
         paneConfig = config;

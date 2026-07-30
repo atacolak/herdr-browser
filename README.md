@@ -245,33 +245,58 @@ export HERDR_BROWSER_CHROME="/path/to/chrome"
 The current release does not download Chromium automatically. If no compatible
 browser is installed, startup fails with a discovery error.
 
-## External CDP
+## External CDP and Observe Mirror
 
-By default the plugin launches and owns a headless Chromium. To attach instead
-to a browser you already started on this machine, point it at that browser's
-**loopback** CDP HTTP endpoint:
+Herdr Browser can attach to an externally owned Chromium that already exposes a
+CDP HTTP endpoint (`HERDR_BROWSER_CDP_URL`), instead of launching its own
+browser. Two attach postures are supported:
 
-```bash
-export HERDR_BROWSER_CDP_URL="http://127.0.0.1:9222"
-# or in browser.json: { "cdpUrl": "http://127.0.0.1:9222" }
+| Mode | How to enable | Target behavior |
+|------|---------------|-----------------|
+| **External sidecar** (default when only `HERDR_BROWSER_CDP_URL` is set) | `HERDR_BROWSER_CDP_URL=http://127.0.0.1:PORT` | Creates a **new** page target and owns only that target (and its popups). Pre-existing tabs are left alone. Interactive toolbar/input work as usual. |
+| **Observe mirror** | `HERDR_BROWSER_MODE=observe_mirror` plus `HERDR_BROWSER_TARGET_STATE=<path>` and `HERDR_BROWSER_CDP_URL` | Attaches to the `active_target_id` published by an external controller. **Never** calls `Target.createTarget` / `Target.closeTarget`. No tab create/close/switch, navigation, or input. Toolbar shows `[OBSERVE]`. Pane close disconnects only. |
+
+Shared ownership rules for both external postures:
+
+- Herdr never launches or kills the external Chrome process.
+- Daemon shutdown, pane close, and crash recovery disconnect only.
+- Stale-daemon reaping never signals an external browser PID.
+- Daemon state paths are namespaced by Herdr session **and** CDP endpoint.
+
+### Observe-mirror target state
+
+An external controller atomically publishes JSON (temp + rename) at a path of
+its choice. Schema `version: 1`:
+
+```json
+{
+  "version": 1,
+  "seq": 3,
+  "updated_at": "2026-07-28T12:00:00Z",
+  "source_id": "controller-1",
+  "active_target_id": "CDP_TARGET_ID",
+  "cdp_url": "http://127.0.0.1:9222",
+  "browser_generation": "optional",
+  "page": { "url": "https://example.test", "title": "Example" }
+}
 ```
 
-Only plain `http://` on `127.0.0.1`, `localhost`, or `[::1]` is accepted (Chrome
-remote debugging is local HTTP, not HTTPS). `HERDR_BROWSER_CDP_URL` wins when
-both are set. Omit both for owned launch.
+Herdr follows `seq` advances, reattaches when `active_target_id` changes, and
+rejects snapshots whose `browser_generation` / `source_generation` disagree with
+the first bound values (when present). The legacy names `worker_id` and
+`worker_generation` are accepted as aliases. A null `active_target_id` detaches
+locally without closing the page.
 
-Ownership rules:
+Launch example:
 
-- Never launches, kills, or reaps the external browser.
-- Daemon shutdown and pane close only disconnect; browser death is observed via
-  the existing browser websocket close path.
-- Each view creates and owns a new page target; pre-existing tabs are left alone.
-- Daemon state files are namespaced by session and CDP endpoint so multiple
-  external ports can coexist.
+```bash
+export HERDR_BROWSER_MODE=observe_mirror
+export HERDR_BROWSER_CDP_URL="http://127.0.0.1:9222"
+export HERDR_BROWSER_TARGET_STATE="/path/to/active-target.json"
+bun run src/viewer.ts
+```
 
-Start Chrome with remote debugging on loopback, confirm `/json/version`
-answers, then open a browser pane or run the CLI with the env set. Unset the
-env (and remove `cdpUrl`) to return to owned launch.
+Config file keys (env wins): `cdpUrl`, `browserMode`, `targetStatePath`.
 
 ## Rendering
 

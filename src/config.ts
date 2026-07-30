@@ -20,6 +20,7 @@ import {
   validScreencastEveryNthFrame,
 } from "./screencastCadence";
 import { SerialQueue } from "./serialQueue";
+import type { BrowserMode } from "./targetState";
 
 export type BrowserPluginConfig = {
   linkOpenPlacement: "split" | "overlay" | "tab" | "zoomed";
@@ -34,6 +35,13 @@ export type BrowserPluginConfig = {
   profileRoot: string | null;
   /** External CDP HTTP base URL. Null = launch owned Chrome. */
   cdpUrl: string | null;
+  /**
+   * default = owned launch or external sidecar (creates its own target).
+   * observe_mirror = attach-only follow of externally published target-state JSON.
+   */
+  browserMode: BrowserMode;
+  /** Path to atomically published active-target state JSON. */
+  targetStatePath: string | null;
 };
 
 const DEFAULT_CONFIG: BrowserPluginConfig = {
@@ -48,6 +56,8 @@ const DEFAULT_CONFIG: BrowserPluginConfig = {
   screencastPollMs: DEFAULT_SCREENCAST_POLL_MS,
   profileRoot: null,
   cdpUrl: null,
+  browserMode: "default",
+  targetStatePath: null,
 };
 const configWriteQueue = new SerialQueue();
 
@@ -94,6 +104,10 @@ export function normalizeConfig(raw: unknown): BrowserPluginConfig {
     cdpUrl: typeof source.cdpUrl === "string" && source.cdpUrl.trim().length > 0
       ? normalizeCdpHttpUrl(source.cdpUrl)
       : DEFAULT_CONFIG.cdpUrl,
+    browserMode: parseBrowserMode(source.browserMode ?? source.mode),
+    targetStatePath: typeof source.targetStatePath === "string" && source.targetStatePath.trim().length > 0
+      ? source.targetStatePath.trim()
+      : DEFAULT_CONFIG.targetStatePath,
   };
 }
 
@@ -119,6 +133,35 @@ export function applyBrowserConfigEnv(
   } else {
     delete env.HERDR_BROWSER_CDP_URL;
   }
+  if (!env.HERDR_BROWSER_MODE?.trim()) {
+    if (config.browserMode !== "default") {
+      env.HERDR_BROWSER_MODE = config.browserMode;
+    } else {
+      delete env.HERDR_BROWSER_MODE;
+    }
+  } else {
+    env.HERDR_BROWSER_MODE = env.HERDR_BROWSER_MODE.trim();
+  }
+  if (!env.HERDR_BROWSER_TARGET_STATE?.trim()) {
+    if (config.targetStatePath) {
+      env.HERDR_BROWSER_TARGET_STATE = config.targetStatePath;
+    } else {
+      delete env.HERDR_BROWSER_TARGET_STATE;
+    }
+  } else {
+    env.HERDR_BROWSER_TARGET_STATE = env.HERDR_BROWSER_TARGET_STATE.trim();
+  }
+}
+
+function parseBrowserMode(value: unknown): BrowserMode {
+  if (typeof value !== "string") {
+    return DEFAULT_CONFIG.browserMode;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "observe_mirror" || normalized === "observe-mirror") {
+    return "observe_mirror";
+  }
+  return "default";
 }
 
 export function saveBrowserZoom(
